@@ -651,3 +651,99 @@ async def test_azure_passthrough_denies_other_team_vector_store_index():
             )
 
     assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_provider_native_vector_store_id_passes_through_by_default():
+    """Upstream default: provider-native ids keep the direct-provider behavior."""
+    from litellm.proxy.vector_store_endpoints.utils import (
+        assert_user_can_access_vector_store_id,
+    )
+
+    with (
+        patch.object(litellm, "vector_store_registry", None),
+        patch("litellm.proxy.proxy_server.prisma_client", None),
+        patch("litellm.proxy.proxy_server.general_settings", {}),
+    ):
+        resolved = await assert_user_can_access_vector_store_id(
+            vector_store_id="vs_provider_native",
+            user_api_key_dict=litellm.proxy._types.UserAPIKeyAuth(team_id="team-a"),
+        )
+
+    assert resolved is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_admin", [True, False])
+async def test_require_managed_vector_store_ids_gate(is_admin):
+    """R2-32: with require_managed_vector_store_ids, a provider-native id is
+    rejected for key holders, while admins may still use raw ids."""
+    from litellm.proxy._types import LitellmUserRoles
+    from litellm.proxy.vector_store_endpoints.utils import (
+        PROVIDER_NATIVE_VECTOR_STORE_IDS_DISABLED_MESSAGE,
+        assert_user_can_access_vector_store_id,
+    )
+
+    auth: Final = UserAPIKeyAuth(
+        user_role=LitellmUserRoles.PROXY_ADMIN if is_admin else None,
+        team_id="team-a",
+    )
+    with (
+        patch.object(litellm, "vector_store_registry", None),
+        patch("litellm.proxy.proxy_server.prisma_client", None),
+        patch(
+            "litellm.proxy.proxy_server.general_settings",
+            {"require_managed_vector_store_ids": True},
+        ),
+    ):
+        if is_admin:
+            resolved = await assert_user_can_access_vector_store_id(
+                vector_store_id="vs_provider_native",
+                user_api_key_dict=auth,
+            )
+            assert resolved is None
+        else:
+            with pytest.raises(HTTPException) as excinfo:
+                await assert_user_can_access_vector_store_id(
+                    vector_store_id="vs_provider_native",
+                    user_api_key_dict=auth,
+                )
+            assert excinfo.value.status_code == 403
+            assert PROVIDER_NATIVE_VECTOR_STORE_IDS_DISABLED_MESSAGE in excinfo.value.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_admin", [True, False])
+async def test_vector_store_routes_reject_native_ids_when_gate_enabled(is_admin):
+    """The vector_stores route rewriter carries the same gate (R2-32)."""
+    from litellm.proxy._types import LitellmUserRoles
+    from litellm.proxy.vector_store_endpoints.endpoints import (
+        _update_request_data_with_litellm_managed_vector_store_registry as update_data,
+    )
+
+    auth: Final = UserAPIKeyAuth(
+        user_role=LitellmUserRoles.PROXY_ADMIN if is_admin else None,
+        team_id="team-a",
+    )
+    with (
+        patch.object(litellm, "vector_store_registry", None),
+        patch("litellm.proxy.proxy_server.prisma_client", None),
+        patch(
+            "litellm.proxy.proxy_server.general_settings",
+            {"require_managed_vector_store_ids": True},
+        ),
+    ):
+        if is_admin:
+            data = await update_data(
+                data={"vector_store_id": "vs_native"},
+                vector_store_id="vs_provider_native",
+                user_api_key_dict=auth,
+            )
+            assert data["vector_store_id"] == "vs_native"
+        else:
+            with pytest.raises(HTTPException):
+                await update_data(
+                    data={"vector_store_id": "vs_provider_native"},
+                    vector_store_id="vs_provider_native",
+                    user_api_key_dict=auth,
+                )

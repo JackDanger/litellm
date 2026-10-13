@@ -329,6 +329,35 @@ async def get_litellm_managed_vector_store(
         ) from e
 
 
+REQUIRE_MANAGED_VECTOR_STORE_IDS_SETTING: Final = "require_managed_vector_store_ids"
+PROVIDER_NATIVE_VECTOR_STORE_IDS_DISABLED_MESSAGE: Final = (
+    "Unmanaged (provider-native) vector store identifiers are not permitted. "
+    "Multi-tenant deployments require vector stores to be registered as LiteLLM-managed "
+    "stores (require_managed_vector_store_ids)."
+)
+
+
+def require_managed_vector_store_ids_enabled() -> bool:
+    """True when the deployment rejects provider-native vector store ids (R2-32)."""
+    from litellm.proxy.proxy_server import general_settings  # circular-import guard
+
+    return general_settings.get(REQUIRE_MANAGED_VECTOR_STORE_IDS_SETTING) is True
+
+
+def assert_provider_native_vector_store_ids_allowed(
+    vector_store_id: str,
+    user_api_key_dict: UserAPIKeyAuth,
+) -> None:
+    """Raise 403 for an unregistered (provider-native) vector-store id when the
+    deployment requires managed ids: a provider-native id carries no ownership
+    row, so on a multi-tenant deployment any key holder could reach any store
+    in the configured provider account through its raw id (R2-32)."""
+    if _is_proxy_admin(user_api_key_dict):
+        return
+    if require_managed_vector_store_ids_enabled():
+        raise HTTPException(status_code=403, detail=PROVIDER_NATIVE_VECTOR_STORE_IDS_DISABLED_MESSAGE)
+
+
 async def assert_user_can_access_vector_store(
     vector_store: LiteLLM_ManagedVectorStore,
     user_api_key_dict: UserAPIKeyAuth,
@@ -347,10 +376,17 @@ async def assert_user_can_access_vector_store_id(
     """
     Resolve a managed vector store id and enforce ownership if it exists.
 
-    Unknown ids are treated as provider-native ids and are not rejected here.
+    Unknown ids are treated as provider-native ids: under
+    ``require_managed_vector_store_ids`` they are rejected for non-admin
+    callers, otherwise they pass through to preserve direct provider behavior.
     """
     vector_store: Final = await get_litellm_managed_vector_store(vector_store_id=vector_store_id)
-    if vector_store is not None:
+    if vector_store is None:
+        assert_provider_native_vector_store_ids_allowed(
+            vector_store_id=vector_store_id,
+            user_api_key_dict=user_api_key_dict,
+        )
+    else:
         await assert_user_can_access_vector_store(
             vector_store=vector_store,
             user_api_key_dict=user_api_key_dict,
