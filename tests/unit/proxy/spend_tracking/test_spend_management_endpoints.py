@@ -8460,3 +8460,40 @@ def test_spend_calculate_rejection_body_is_openai_shaped(client):
     assert error["type"] == "invalid_request_error"
     assert error["param"] is None
     assert error["code"] == "400"
+
+def test_spend_log_read_scoping_covers_all_non_admin_roles():
+    """Org admins and roleless keys with an identity are identity-scoped too;
+    only proxy admin and admin viewer keep the global read (R2-12, R2-19)."""
+    from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.spend_tracking.spend_management_endpoints import (
+        _can_user_view_spend_log,
+    )
+
+    assert (
+        _can_user_view_spend_log(
+            UserAPIKeyAuth(user_role=LitellmUserRoles.INTERNAL_USER, user_id="alice")
+        )
+        is True
+    )
+    assert (
+        _can_user_view_spend_log(UserAPIKeyAuth(user_id="alice"))  # roleless
+        is True
+    )
+    assert (
+        _can_user_view_spend_log(
+            UserAPIKeyAuth(user_role=LitellmUserRoles.INTERNAL_USER_VIEW_ONLY, user_id="alice")
+        )
+        is True
+    )
+    assert (
+        _can_user_view_spend_log(
+            UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin")
+        )
+        is False
+    )
+    assert (
+        _can_user_view_spend_log(
+            UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN_VIEW_ONLY, user_id="viewer")
+        )
+        is False
+    )

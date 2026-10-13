@@ -3467,10 +3467,10 @@ async def view_spend_logs(
     """
     from litellm.proxy.proxy_server import prisma_client
 
-    if (
-        user_api_key_dict.user_role == LitellmUserRoles.INTERNAL_USER
-        or user_api_key_dict.user_role == LitellmUserRoles.INTERNAL_USER_VIEW_ONLY
-    ):
+    if _can_user_view_spend_log(user_api_key_dict=user_api_key_dict):
+        # every role below proxy-admin level gets identity-scoped spend logs
+        # (org admins and roleless keys included; previously org admins saw
+        # cross-org prompt payloads) (R2-12)
         user_id = user_api_key_dict.user_id
 
     try:
@@ -4838,15 +4838,20 @@ async def _can_team_member_view_log(
 
 def _can_user_view_spend_log(user_api_key_dict: UserAPIKeyAuth) -> bool:
     """
-    Check if the requesting user can view their own spend logs.
+    Whether a caller is subject to owned-row read scoping on spend logs (R2-12,
+    R2-19). Every role below proxy-admin level (including org admins and
+    roleless virtual keys with an identity) reads their own rows and their
+    permitted teams instead of everything; proxy admins and admin viewers keep
+    the global read. An identifier-less principal stays unscoped here only to
+    keep the OwnedRows(None) fail-closed degradation callers already rely on.
     """
     user_role: Final = user_api_key_dict.user_role
     user_id: Final = user_api_key_dict.user_id
     return (
         user_role
-        in (
-            LitellmUserRoles.INTERNAL_USER,
-            LitellmUserRoles.INTERNAL_USER_VIEW_ONLY,
+        not in (
+            LitellmUserRoles.PROXY_ADMIN,
+            LitellmUserRoles.PROXY_ADMIN_VIEW_ONLY,
         )
         and user_id is not None
     )
