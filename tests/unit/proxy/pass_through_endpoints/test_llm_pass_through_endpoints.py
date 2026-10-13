@@ -3348,8 +3348,10 @@ class TestForwardHeaders:
     @pytest.mark.asyncio
     async def test_pass_through_request_with_forward_headers_true(self):
         """
-        Test that when forward_headers=True, user headers from the main request
-        are forwarded to the target endpoint (except content-length and host)
+        Test that when forward_headers=True, non-credential user headers from
+        the main request are forwarded to the target endpoint. Credential
+        headers (authorization, cookie, proxy-authorization) and HTTP framing
+        headers do not relay, on top of content-length and host
         """
         from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
             pass_through_request,
@@ -3366,10 +3368,11 @@ class TestForwardHeaders:
         user_headers = {
             "x-custom-header": "custom-value",
             "x-api-key": "user-api-key",
-            "authorization": "Bearer user-token",
+            "cookie": "session=caller-cookie",
             "user-agent": "test-client/1.0",
             "content-type": "application/json",
             # These should NOT be forwarded
+            "transfer-encoding": "chunked",
             "content-length": "123",
             "host": "original-host.com",
         }
@@ -3436,12 +3439,16 @@ class TestForwardHeaders:
             call_args = mock_client.build_request.call_args
             sent_headers = call_args[1]["headers"]
 
-            # Verify user headers were forwarded (except content-length and host)
+            # Verify user headers were forwarded (except credential/framing ones)
             assert sent_headers["x-custom-header"] == "custom-value"
             assert sent_headers["x-api-key"] == "user-api-key"
-            assert sent_headers["authorization"] == "Bearer user-token"
             assert sent_headers["user-agent"] == "test-client/1.0"
             assert sent_headers["content-type"] == "application/json"
+
+            # Credential and framing headers never relay to the target
+            assert "authorization" not in sent_headers
+            assert "cookie" not in sent_headers
+            assert "transfer-encoding" not in sent_headers
 
             # Verify custom headers were included
             assert sent_headers["x-litellm-header"] == "litellm-value"

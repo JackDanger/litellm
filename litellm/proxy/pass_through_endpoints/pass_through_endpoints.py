@@ -1536,9 +1536,13 @@ async def pass_through_request(
                 )
             )
         resolved_timeout: Final = resolve_pass_through_request_timeout(timeout)
+        # Redirects are not followed server-side: the per-hop SSRF validation
+        # that gates this URL validated the first hop only, so an attacker
+        # chosen target could otherwise redirect into internal services with
+        # no re-validation. 3xx relays to the client, which follows it itself (R1-H2)
         async_client_obj: Final = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.PassThroughEndpoint,
-            params={"timeout": resolved_timeout},
+            params={"timeout": resolved_timeout, "follow_redirects": False},
         )
         async_client: Final = async_client_obj.client
         passthrough_logging_payload: Final = PassthroughStandardLoggingPayload(

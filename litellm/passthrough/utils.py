@@ -25,7 +25,7 @@ _PASS_THROUGH_PROTECTED_HEADERS: Final[frozenset] = frozenset(
 )
 
 # Header name prefix used to block AWS SigV4 signing headers from being overridden.
-_PASS_THROUGH_PROTECTED_HEADER_PREFIXES: Final[tuple[str, ...]] = ("x-amz-",)
+_PASS_THROUGH_PROTECTED_HEADER_PREFIXES: Final[tuple[str, ...]] = ("x-amz-", "x-aws-")
 
 
 def _is_forwarded_pass_through_header(header_name: str) -> bool:
@@ -35,6 +35,24 @@ def _is_forwarded_pass_through_header(header_name: str) -> bool:
     return forwarded_name not in _PASS_THROUGH_PROTECTED_HEADERS and not any(
         forwarded_name.startswith(prefix) for prefix in _PASS_THROUGH_PROTECTED_HEADER_PREFIXES
     )
+
+# Headers that carry the caller's own credentials or HTTP framing. They never
+# relay to the upstream target: the caller's key and cookie must not leak
+# wherever the endpoint routes, and hop-by-hop framing would re-introduce
+# request-smuggling framing that httpx otherwise normalizes.
+_REQUEST_RELAY_DROPPED_HEADERS: Final[frozenset] = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "connection",
+        "keep-alive",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
 
 
 class BasePassthroughUtils:
@@ -72,15 +90,10 @@ class BasePassthroughUtils:
         """
         if forward_headers is True:
             # Header We Should NOT forward
-            request_headers.pop("content-length", None)
-            request_headers.pop("host", None)
-            # accept-encoding must stay client-negotiated: forwarding e.g. "br" when
-            # the brotli package is absent relays undecodable bytes to the caller
-            request_headers.pop("accept-encoding", None)
-
             custom_header_names: Final = {header_name.lower() for header_name in headers}
             for header_name in list(request_headers.keys()):
-                if header_name.lower() in custom_header_names:
+                lowered: Final = header_name.lower()
+                if lowered in custom_header_names or lowered in _REQUEST_RELAY_DROPPED_HEADERS:
                     request_headers.pop(header_name, None)
 
             # Combine request headers with custom headers
