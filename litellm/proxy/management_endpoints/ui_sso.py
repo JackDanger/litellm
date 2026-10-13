@@ -3355,6 +3355,13 @@ class SSOAuthenticationHandler:
             )
             with google_sso:
                 return await google_sso.get_login_redirect(state=state, params=google_params)
+                redirect_response: Final = await google_sso.get_login_redirect(state=state)
+                _bind_state_cookie_on_sso_redirect(
+                    redirect_response=redirect_response,
+                    state=state,
+                    request=request,
+                )
+                return redirect_response
         # Microsoft SSO Auth
         elif microsoft_client_id is not None:
             microsoft_client_secret: Final = os.getenv("MICROSOFT_CLIENT_SECRET", None)
@@ -3379,7 +3386,13 @@ class SSOAuthenticationHandler:
                 ),
             )
             with microsoft_sso:
-                return await microsoft_sso.get_login_redirect(state=state)
+                redirect_response: Final = await microsoft_sso.get_login_redirect(state=state)
+                _bind_state_cookie_on_sso_redirect(
+                    redirect_response=redirect_response,
+                    state=state,
+                    request=request,
+                )
+                return redirect_response
         elif generic_client_id is not None:
             from fastapi_sso.sso.base import DiscoveryDocument
             from fastapi_sso.sso.generic import create_provider
@@ -4743,6 +4756,10 @@ class MicrosoftSSOHandler:
             redirect_uri=redirect_url,
             allow_insecure_http=True,
         )
+        _enforce_sso_browser_state(
+            request=request,
+            state=request.query_params.get("state"),
+        )
         original_msft_result: Final = (
             await microsoft_sso.verify_and_process(
                 request=request,
@@ -5106,6 +5123,95 @@ class GoogleSSOHandler:
         )
         google_tokens: Final = _SSOTokenResponse.model_validate(google_sso)
         return result or {}, assertion_from_sso_login(google_tokens.id_token, google_tokens.refresh_token)
+        if return_raw_sso_response:
+            return (
+                await google_sso.verify_and_process(
+                    request=request,
+                    convert_response=False,
+                )
+                or {}
+            )
+
+        _enforce_sso_browser_state(
+            request=request,
+            state=request.query_params.get("state"),
+        )
+        result: Final = await google_sso.verify_and_process(request)
+        return result or {}
+
+
+def _bind_state_cookie_on_sso_redirect(
+    *,
+    redirect_response: RedirectResponse,
+    state: str | None,
+    request: Request | None,
+) -> None:
+    """Bind the redirect's ``state`` to the browser (LD fork R2-13).
+
+    When the CLI/CLI-family flows did not supply a state, mint one, rewrite the
+    redirect's ``Location`` query string to carry it, and set the
+    ``litellm_oauth_state`` HttpOnly cookie binding it to this browser. The
+    callback enforces the same cookie before processing the code.
+    """
+    from fastapi import HTTPException as _HTTPException
+
+    if request is None or redirect_response is None or redirect_response.headers.get("location") is None:
+        return
+    minted: Final = secrets.token_urlsafe(32)
+    location: Final = redirect_response.headers.get("location", "")
+    separator: Final = "&" if "?" in location else "?"
+    redirect_response.headers["location"] = f"{location}{separator}state={minted}"
+    secure_flag: Final = IPAddressUtils.is_request_https(request)
+    redirect_response.set_cookie(
+        key="litellm_oauth_state",
+        value=minted,
+        max_age=600,
+        httponly=True,
+        samesite="lax",
+        secure=secure_flag,
+    )
+
+
+def _enforce_sso_browser_state(request: Request, state: str | None) -> None:
+    """Login-CSRF defense for the non-PKCE Google/Microsoft flows (LD fork R2-13).
+
+    The pinned fastapi-sso (0.19.0) only checks the state when ``requires_state``
+    is already true; for these providers it silently accepts a callback with no
+    state at all, so a pre-minted callback URL signs the victim's browser into
+    the attacker's account. Enforce the URL ``state`` against the
+    ``litellm_oauth_state`` cookie set on the login redirect. CLI device-flow
+    (state starts with the CLI prefix) and empty-state boots are unaffected;
+    deployments that cannot carry cookies can disable enforcement with
+    ``general_settings.disable_sso_login_csrf_protection: true``.
+    """
+    from litellm.constants import (
+        LITELLM_CLI_SESSION_TOKEN_PREFIX,
+    )
+
+    from litellm.proxy.proxy_server import general_settings
+
+    if general_settings.get("disable_sso_login_csrf_protection", False) is True:
+        return
+    from litellm.constants import (
+        LITELLM_CLI_SESSION_TOKEN_PREFIX,
+    )
+
+    # the CLI flow binds differently (single-use poll secret, not a browser
+    # form); its state values carry the CLI session prefix and are validated
+    # separately. Escape hatch: posted CLI states are exempt here.
+    if state and state.startswith(LITELLM_CLI_SESSION_TOKEN_PREFIX + ":"):
+        return
+    if not state:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing state parameter"
+        )
+    cookie_state: Final = request.cookies.get("litellm_oauth_state")
+    if not cookie_state or not secrets.compare_digest(state, cookie_state):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid SSO state parameter: does not match the session-bound OAuth state cookie",
+        )
 
 
 def _raise_if_sso_debug_disabled() -> None:
