@@ -20429,6 +20429,36 @@ async def invitation_update(
             detail={"error": f"Unable to identify user id. Received={user_api_key_dict.user_id}"},
         )
 
+    # Proxy admins can update any invitation; org/team admins only their own
+    is_proxy_admin: Final = user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN
+    is_other_admin: Final = await user_has_admin_privileges(
+        user_api_key_dict=user_api_key_dict,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        proxy_logging_obj=proxy_logging_obj,
+    )
+
+    if not is_proxy_admin and not is_other_admin:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": f"{CommonProxyErrors.not_allowed_access.value}, your role={user_api_key_dict.user_role}"},
+        )
+
+    if is_other_admin and not is_proxy_admin:
+        invitation: Final[_InvitationLinkRow | None] = await InvitationLinkRepository(
+            prisma_client
+        ).table.find_unique(where={"id": data.invitation_id})
+        if invitation is None:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "Invitation id does not exist in the database."},
+            )
+        if invitation.created_by != user_api_key_dict.user_id:
+            raise HTTPException(
+                status_code=403,
+                detail={"error": "Organization admins can only update invitations they created."},
+            )
+
     current_time: Final = litellm.utils.get_utc_datetime()
     response: Final[object] = await InvitationLinkRepository(prisma_client).table.update(
         where={"id": data.invitation_id},

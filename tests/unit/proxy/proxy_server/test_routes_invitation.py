@@ -385,3 +385,94 @@ def test_invitation_delete_db_not_connected_400(client, auth_as, monkeypatch):
     assert response.status_code == 400
     err_text = str(response.json())
     assert "No connected db" in err_text or "db" in err_text.lower()
+
+
+# ---------------------------------------------------------------------------
+# POST /invitation/update — authorization (fork hardening R2-14)
+# ---------------------------------------------------------------------------
+
+
+def test_invitation_update_non_admin_forbidden(
+    client, auth_as, monkeypatch, mock_prisma
+):
+    """Internal user without elevated privileges cannot update invitations."""
+    from litellm.proxy import proxy_server as ps
+    from litellm.proxy._types import LitellmUserRoles
+
+    monkeypatch.setattr(ps, "prisma_client", mock_prisma)
+
+    async def _no_privileges(**kwargs):
+        return False
+
+    monkeypatch.setattr(ps, "user_has_admin_privileges", _no_privileges)
+
+    with auth_as(LitellmUserRoles.INTERNAL_USER):
+        response = client.post(
+            "/invitation/update",
+            json={"invitation_id": "inv-1", "is_accepted": True},
+        )
+
+    assert response.status_code == 400, response.text
+    assert "role=" in response.json()["detail"]["error"]
+
+
+def test_invitation_update_other_admin_only_own_invitation(
+    client, auth_as, monkeypatch, mock_prisma
+):
+    """Org admin can update only invitations they created; foreign ones 403."""
+    from litellm.proxy import proxy_server as ps
+    from litellm.proxy._types import LitellmUserRoles
+
+    mock_prisma.db.litellm_invitationlink.find_unique = AsyncMock(
+        return_value=_make_invitation(
+            invitation_id="inv-1", created_by="someone-else"
+        )
+    )
+    monkeypatch.setattr(ps, "prisma_client", mock_prisma)
+
+    async def _yes_privileges(**kwargs):
+        return True
+
+    monkeypatch.setattr(ps, "user_has_admin_privileges", _yes_privileges)
+
+    with auth_as(LitellmUserRoles.INTERNAL_USER):
+        response = client.post(
+            "/invitation/update",
+            json={"invitation_id": "inv-1", "is_accepted": True},
+        )
+
+    assert response.status_code == 403, response.text
+    assert "only update invitations they created" in response.json()["detail"]["error"]
+
+
+def test_invitation_update_other_admin_own_invitation_happy(
+    client, auth_as, monkeypatch, mock_prisma
+):
+    """Org admin updating their own invitation succeeds."""
+    from litellm.proxy import proxy_server as ps
+    from litellm.proxy._types import LitellmUserRoles
+
+    mock_prisma.db.litellm_invitationlink.find_unique = AsyncMock(
+        return_value=_make_invitation(
+            invitation_id="inv-1", created_by="test-user-id"
+        )
+    )
+    updated = _make_invitation(
+        invitation_id="inv-1", created_by="test-user-id", is_accepted=True
+    )
+    mock_prisma.db.litellm_invitationlink.update = AsyncMock(return_value=updated)
+    monkeypatch.setattr(ps, "prisma_client", mock_prisma)
+
+    async def _yes_privileges(**kwargs):
+        return True
+
+    monkeypatch.setattr(ps, "user_has_admin_privileges", _yes_privileges)
+
+    with auth_as(LitellmUserRoles.INTERNAL_USER):
+        response = client.post(
+            "/invitation/update",
+            json={"invitation_id": "inv-1", "is_accepted": True},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["is_accepted"] is True
