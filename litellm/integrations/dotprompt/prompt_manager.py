@@ -62,6 +62,43 @@ class PromptTemplate:
         return f"PromptTemplate(id='{self.template_id}', model='{self.model}')"
 
 
+_MAX_RENDER_RANGE: Final = 100_000
+_MAX_RENDER_ITEMS: Final = 100_000
+
+
+def _bounded_range(stop: int, start: int | None = None, step: int | None = None):
+    import numbers
+
+    if (
+        isinstance(stop, numbers.Number)
+        and not isinstance(stop, bool)
+        and abs(int(stop)) > _MAX_RENDER_RANGE
+    ):
+        raise ValueError(f"range bound {stop} exceeds the render cap of {_MAX_RENDER_RANGE}")
+    if start is None:
+        return range(stop)
+    if step is None:
+        return range(start, stop)
+    return range(start, stop, step)
+
+
+class BoundedList(list):
+    pass
+
+
+def _bounded_constructor(name: str, ctor):
+    def _bounded_factory(*args, **kwargs):
+        result = ctor(*args, **kwargs)
+        if hasattr(result, "__len__") and len(result) > _MAX_RENDER_ITEMS:
+            raise ValueError(
+                f"{name}(...) materialization exceeds the render item cap ({_MAX_RENDER_ITEMS})"
+            )
+        return result
+
+    _bounded_factory.__name__ = name
+    return _bounded_factory
+
+
 class PromptManager:
     """
     Manager for loading and rendering .prompt files following the Dotprompt specification.
@@ -86,6 +123,10 @@ class PromptManager:
         # Sandboxed env: templates can come from user input via /prompts/test,
         # so we must block access to unsafe Python attributes and mutation of
         # caller-supplied mutables.
+        # Bounded-globals render environment: `range` is capped and `list`/
+        # `dict`/`str` bulk constructors are aliases of bounded wrappers, so a
+        # caller cannot pin the event loop with range(2**60) or OOM the worker
+        # with an eager |list materialization from /prompts/test (LD fork R1-M8).
         self.jinja_env = ImmutableSandboxedEnvironment(
             loader=DictLoader({}),
             autoescape=select_autoescape(["html", "xml"]),
@@ -97,6 +138,11 @@ class PromptManager:
             comment_start_string="{#",
             comment_end_string="#}",
         )
+        self.jinja_env.globals["range"] = _bounded_range
+        self.jinja_env.globals["list"] = _bounded_constructor("list", list)
+        self.jinja_env.globals["dict"] = _bounded_constructor("dict", dict)
+        self.jinja_env.globals["tuple"] = _bounded_constructor("tuple", tuple)
+        self.jinja_env.globals["set"] = _bounded_constructor("set", set)
 
         # Load prompts from directory if provided
         if self.prompt_directory:

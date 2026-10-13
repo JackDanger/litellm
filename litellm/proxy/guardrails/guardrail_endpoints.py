@@ -1687,8 +1687,14 @@ async def validate_blocked_words_file(request: dict[str, str]):
         file_content: Final = request.get("file_content", "")
         if not file_content:
             return {"valid": False, "error": "No file content provided"}
+<<<<<<< HEAD
 
         data: Final = _DECODED_YAML.validate_python(yaml.safe_load(file_content))
+=======
+        if len(file_content) > 512_000:
+            return {"valid": False, "error": "File content exceeds 512 KB"}
+        data: Final = yaml.safe_load(file_content)
+>>>>>>> c7599bc93ef (fix: bounded jinja render globals and yaml size cap (R1-M8, R1-M9))
 
         if not isinstance(data, dict) or "blocked_words" not in data:
             return {
