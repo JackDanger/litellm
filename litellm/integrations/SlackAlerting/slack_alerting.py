@@ -87,6 +87,28 @@ def _proxy_llm_router() -> Router | None:
 _DAILY_REPORT_TARGET: Final = "daily_report_schedule"
 
 
+_SLACK_MRKDWN_CONTROL_REPLACEMENTS: Final = (
+    ("&", "&amp;"),
+    ("<", "&lt;"),
+    (">", "&gt;"),
+    ("`", "\u02cb"),
+)
+
+
+def _escape_slack_mrkdwn(text: str) -> str:
+    """Neutralize Slack mrkdwn/mention/link control characters.
+
+    Angle brackets toggle mentions (`<@U123>`), `<!channel>` and link syntax
+    (`<https://evil|label>`); backticks let a client escape the quoting the
+    message template uses. Replace rather than delete so operators still see
+    the attacker's bytes (LD fork R1-M10).
+    """
+    escaped: str = text
+    for sequence, replacement in _SLACK_MRKDWN_CONTROL_REPLACEMENTS:
+        escaped = escaped.replace(sequence, replacement)
+    return escaped
+
+
 class SlackAlerting(CustomBatchLogger):
     """
     Class for sending Slack Alerts
@@ -1497,7 +1519,13 @@ Model Info:
                 formatted_message += f"\n\n{key}: `{value}`\n\n"
         if alerting_metadata:
             for key, value in alerting_metadata.items():
-                formatted_message += f"\n\n*Alerting Metadata*: \n{key}: `{value}`\n\n"
+                # Client-supplied metadata is untrusted text: escape mrkdwn
+                # control characters (<, >, @-mentions, link syntax, backticks)
+                # so an LLM-key holder cannot inject mentions, fake orders or
+                # phishing links into the on-call channel (LD fork R1-M10).
+                safe_key: Final = _escape_slack_mrkdwn(str(key))
+                safe_value: Final = _escape_slack_mrkdwn(str(value))
+                formatted_message += f"\n\n*Alerting Metadata*: \n{safe_key}: `{safe_value}`\n\n"
         if _proxy_base_url is not None:
             formatted_message += f"\n\nProxy URL: `{_proxy_base_url}`"
 

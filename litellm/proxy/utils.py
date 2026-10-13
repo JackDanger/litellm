@@ -4111,9 +4111,13 @@ class ProxyLogging:
             if litellm_debug_info is not None:
                 exception_str += litellm_debug_info
 
+            from litellm.integrations.SlackAlerting.slack_alerting import (
+                _escape_slack_mrkdwn,
+            )
+
             asyncio.create_task(
                 self.alerting_handler(
-                    message=redact_string(f"LLM API call failed: `{exception_str}`"),
+                    message=redact_string(f"LLM API call failed: `{_escape_slack_mrkdwn(exception_str)}`"),
                     level="High",
                     alert_type=AlertType.llm_exceptions,
                     request_data=request_data,
