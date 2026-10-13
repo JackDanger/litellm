@@ -666,3 +666,45 @@ async def test_batch_charge_is_shared_across_workers_and_requires_redis_confirma
     await second._push_in_memory_increments_to_redis()
     assert float(await client.get("provider_spend:openai:1d")) == 0.5
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_window_resets_claim_exactly_once():
+    """R2-26: two workers racing a fresh budget window must not overwrite each
+    other's response_cost — the SET NX claim lets exactly one worker seed the
+    window and the loser's cost still lands as an in-window increment."""
+    from fakeredis import FakeServer, FakeRedis as FakeSyncRedis
+    from fakeredis.aioredis import FakeRedis
+    from litellm.caching.redis_cache import RedisCache
+
+    server: Final = FakeServer()
+    client: Final = FakeRedis(server=server)
+    sync_client: Final = FakeSyncRedis(server=server)
+    redis_cache: Final = RedisCache(host="router-window-race", connection_pool=sync_client.connection_pool)
+    litellm.in_memory_llm_clients_cache.set_cache(key=redis_cache._get_async_client_cache_key(), value=client)
+
+    first: Final = RouterBudgetLimiting(dual_cache=DualCache(redis_cache=redis_cache), provider_budget_config={})
+    second: Final = RouterBudgetLimiting(dual_cache=DualCache(redis_cache=redis_cache), provider_budget_config={})
+
+    await asyncio.gather(
+        first._handle_new_budget_window(
+            spend_key="provider_spend:openai:1d",
+            start_time_key="provider_budget_start_time:openai",
+            current_time=1000.0,
+            response_cost=5.0,
+            ttl_seconds=86400,
+        ),
+        second._handle_new_budget_window(
+            spend_key="provider_spend:openai:1d",
+            start_time_key="provider_budget_start_time:openai",
+            current_time=1000.0,
+            response_cost=7.0,
+            ttl_seconds=86400,
+        ),
+    )
+    await first._push_in_memory_increments_to_redis()
+    await second._push_in_memory_increments_to_redis()
+
+    final_spend: Final = float(await client.get("provider_spend:openai:1d"))
+    assert final_spend == 12.0, f"both workers' costs must land in the shared window; got {final_spend}"
+    await client.aclose()
