@@ -619,7 +619,10 @@ async def create_file(
         elif max_file_size_mb is not None and max_file_size_mb > 0:
             file_source = await file.read(max_file_size_mb * MB + 1)
         else:
-            file_source = await file.read()
+            # Unbounded read() only when no cap configured is an OOM vector
+            # via concurrent uploads from any key (LD fork R1-M7): apply a
+            # 200 MB floor-cap so even unset configs bound the read.
+            file_source = await file.read(200 * MB + 1)
         custom_llm_provider = (
             provider
             or get_custom_llm_provider_from_request_headers(request=request)

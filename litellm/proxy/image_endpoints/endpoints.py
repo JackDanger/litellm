@@ -48,14 +48,30 @@ IMAGE_EDIT_OPTIONAL_FIELD_DEFAULTS: Final = MappingProxyType({"prompt": None, "i
 IMAGE_ARRAY_FIELD: Final = "image[]"
 MASK_ARRAY_FIELD: Final = "mask[]"
 BRACKETED_FILE_FIELDS: Final = frozenset({IMAGE_ARRAY_FIELD, MASK_ARRAY_FIELD})
+MB_IN_BYTES: Final = 1024 * 1024
 
 
-async def uploadfile_to_bytesio(upload: UploadFile) -> io.BytesIO:
-    """
-    Read a FastAPI UploadFile into a BytesIO and set .name so OpenAI SDK
-    infers filename/content-type correctly.
-    """
-    data: Final = await upload.read()
+async def uploadfile_to_bytesio(
+    upload: UploadFile,
+    max_file_size_mb: int | None = None,
+) -> io.BytesIO:
+    """Read a FastAPI UploadFile into BytesIO, enforcing max_file_size_mb when
+    configured. Without the cap every /v1/images/edits upload was buffered in
+    RAM unbounded regardless of the general_settings cap protecting /v1/files
+    (LD fork R1-M6)."""
+    if max_file_size_mb is not None and max_file_size_mb > 0:
+        head: Final = await upload.read(max_file_size_mb * MB_IN_BYTES + 1)
+        if len(head) > max_file_size_mb * MB_IN_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "error": f"File too large: exceeds max_file_size_mb={max_file_size_mb}."
+                },
+                headers={"content-length": str(max_file_size_mb * MB_IN_BYTES)},
+            )
+        data: Final = head
+    else:
+        data: Final = await upload.read()
     buffer: Final = io.BytesIO(data)
     buffer.name = upload.filename
     return buffer
@@ -328,8 +344,22 @@ async def image_edit_api(
         for key, value in chain(IMAGE_EDIT_OPTIONAL_FIELD_DEFAULTS.items(), form_fields.items())
         if key not in BRACKETED_FILE_FIELDS
     }
-    image_files: Final = await batch_to_bytesio(image)
-    mask_files: Final = await batch_to_bytesio(mask)
+    from litellm.proxy.openai_files_endpoints.general_upload_validation import (
+        coerce_optional_int_setting,
+    )
+
+    max_file_size_mb_setting: Final = coerce_optional_int_setting(
+        general_settings.get("max_file_size_mb")
+    )
+    # Unbounded default is not safe without the request-size middleware (which is
+    # enterprise-gated); cap at 200 MB even when unset (LD fork R1-M6).
+    max_file_size_mb: Final = (
+        max_file_size_mb_setting
+        if max_file_size_mb_setting is not None and max_file_size_mb_setting > 0
+        else 200
+    )
+    image_files: Final = await batch_to_bytesio(image, max_file_size_mb=max_file_size_mb)
+    mask_files: Final = await batch_to_bytesio(mask, max_file_size_mb=max_file_size_mb)
     if image_files:
         data["image"] = image_files
     if mask_files:
