@@ -2140,11 +2140,10 @@ class LiteLLMProxyRequestSetup:
         data[_metadata_variable_name].update(user_api_key_logged_metadata)
         data[_metadata_variable_name]["user_api_key"] = LiteLLMProxyRequestSetup.get_logged_api_key(user_api_key_dict)
 
-        # Key-owned agent_id for spend attribution; keep existing (e.g. from header) if key has none
+        # Key-owned agent_id for spend attribution; caller-supplied metadata
+        # must not influence it (R2-47).
         _key_agent_id: Final = getattr(user_api_key_dict, "agent_id", None)
-        _existing_agent_id: Final = data[_metadata_variable_name].get("agent_id")
-        _resolved_agent_id: Final = _key_agent_id or _existing_agent_id
-        data[_metadata_variable_name]["agent_id"] = user_api_key_dict.invoked_agent_id or _resolved_agent_id
+        data[_metadata_variable_name]["agent_id"] = user_api_key_dict.invoked_agent_id or _key_agent_id
         managed_context: Final = user_api_key_dict.managed_agent_context
         data[_metadata_variable_name].update(
             MappingProxyType(

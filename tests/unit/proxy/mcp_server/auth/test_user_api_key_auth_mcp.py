@@ -13252,3 +13252,25 @@ async def test_admin_dashboard_session_keeps_the_whole_mcp_registry(
     assert set(await global_mcp_server_manager.get_allowed_mcp_servers(dashboard_session)) == set(
         global_mcp_server_manager.get_registry()
     )
+
+
+def test_oauth2_promotion_requires_exact_header_name():
+    """R2-45 canary: promotion must match `authorization` exactly — a caller
+    header like `authorization-wrapper` must not shadow the real Authorization
+    during OAuth2 promotion (prefix matching restored the shadow)."""
+    from starlette.datastructures import Headers
+
+    from litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp import (
+        MCPRequestHandler,
+    )
+
+    headers = Headers(
+        raw=[
+            (b"authorization", b"Bearer real-token"),
+            (b"authorization-wrapper", b"Bearer shadow-token"),
+        ]
+    )
+    promoted = MCPRequestHandler.get_oauth2_headers_from_headers(headers)
+    assert promoted.get("Authorization") == "Bearer real-token", (
+        f"the exact-match promotion must keep the real Authorization; got {promoted}"
+    )

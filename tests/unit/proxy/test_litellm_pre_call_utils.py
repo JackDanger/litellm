@@ -11575,3 +11575,35 @@ def test_caller_tags_reach_litellm_metadata_whether_metadata_is_a_dict_or_a_json
     LiteLLMProxyRequestSetup.merge_caller_body_tags(request_data=data)
     assert set(data["litellm_metadata"]["tags"]) == {"key-tag", "client-tag"}
     assert data["metadata"] == caller_metadata
+
+
+def test_key_owned_agent_id_beats_caller_metadata():
+    """R2-47 canary: spend-log agent attribution is key-owned — caller-supplied
+    metadata (agent_id in the request) must not override the minting key's
+    attribution, so an attacker cannot forge which agent billed a spend row."""
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
+
+    key_auth = UserAPIKeyAuth(
+        api_key="sk-key",
+        user_id="alice",
+        invoked_agent_id="invoked-agent-7",
+        agent_id="key-owner-agent",
+        managed_agent_context=None,
+    )
+    data = {"metadata": {"agent_id": "attacker-forged-agent"}}
+
+    out = LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata(
+        data,
+        key_auth,
+        "metadata",
+    )
+
+    metadata = (out or {}).get("metadata", {})
+    assert metadata.get("agent_id") in ("invoked-agent-7", "key-owner-agent"), (
+        f"attribution must be key-owned; got {metadata.get('agent_id')}"
+    )
+    assert metadata.get("agent_id") != "attacker-forged-agent", (
+        "caller-supplied agent_id must not win (R2-47)"
+    )

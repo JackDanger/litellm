@@ -1899,7 +1899,10 @@ class MCPRequestHandler:
         """
         oauth2_headers: Final = {}
         for header_name, header_value in headers.items():
-            if header_name.lower().startswith("authorization"):
+            # Exact match only: a prefix match would let a caller-supplied
+            # header like `authorization-<suffix>` shadow the real
+            # Authorization header during OAuth2 promotion (R2-45).
+            if header_name.lower() == "authorization":
                 oauth2_headers["Authorization"] = header_value
         return oauth2_headers
 
