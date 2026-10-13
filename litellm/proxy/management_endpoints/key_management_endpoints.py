@@ -1527,6 +1527,12 @@ async def _common_key_generation_helper(
         user_api_key_dict=user_api_key_dict,
         prisma_client=prisma_client,
     )
+    await _validate_budget_id_change(
+        requested_budget_id=data.budget_id,
+        existing_budget_id=None,
+        user_api_key_dict=user_api_key_dict,
+        prisma_client=prisma_client,
+    )
 
     enforce_output_token_estimates_are_admin_only(
         data=data,
@@ -3634,6 +3640,24 @@ def _requested_end_user_budget_id(data: KeyRequestBase) -> str | None:
     return get_key_end_user_budget_id(data.metadata) or ""
 
 
+async def _validate_budget_id_change(
+    requested_budget_id: str | None,
+    existing_budget_id: str | None,
+    user_api_key_dict: UserAPIKeyAuth,
+    prisma_client: PrismaClient | None,
+) -> None:
+    """A key's budget_id row supplies the key's effective limits (max_budget,
+    tpm/rpm, model_max_budget) from LiteLLM_BudgetTable, so only proxy admins
+    may change it. The delegation-ceiling check fires only when max_budget is
+    set explicitly, so an unvalidated budget_id bypasses it entirely (R1-H3).
+    Dangling ids stay a no-op, as upstream treats them."""
+    if requested_budget_id is None or requested_budget_id == (existing_budget_id or ""):
+        return
+    if user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN.value:
+        forbidden_detail: Final = {"error": "Only proxy admins can set budget_id on a key."}
+        raise HTTPException(status_code=403, detail=forbidden_detail)
+
+
 async def _validate_end_user_budget_id_change(
     requested_budget_id: str | None,
     existing_budget_id: str | None,
@@ -3877,6 +3901,12 @@ async def _validate_update_key_data(
         existing_budget_id=get_key_end_user_budget_id(
             _existing_metadata if isinstance(_existing_metadata, dict) else None
         ),
+        user_api_key_dict=user_api_key_dict,
+        prisma_client=checked_prisma_client,
+    )
+    await _validate_budget_id_change(
+        requested_budget_id=data.budget_id,
+        existing_budget_id=getattr(existing_key_row, "budget_id", None),
         user_api_key_dict=user_api_key_dict,
         prisma_client=checked_prisma_client,
     )
@@ -6379,6 +6409,12 @@ async def _execute_virtual_key_regeneration(
             existing_budget_id=get_key_end_user_budget_id(
                 _existing_key_metadata if isinstance(_existing_key_metadata, dict) else None
             ),
+            user_api_key_dict=user_api_key_dict,
+            prisma_client=prisma_client,
+        )
+        await _validate_budget_id_change(
+            requested_budget_id=data.budget_id,
+            existing_budget_id=getattr(key_in_db, "budget_id", None),
             user_api_key_dict=user_api_key_dict,
             prisma_client=prisma_client,
         )

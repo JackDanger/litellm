@@ -24464,3 +24464,50 @@ def test_non_admin_resaving_referencing_key_metadata_read_back_encrypted_is_not_
         raise_on_logging_credential_change({"note": "unrelated edit"}, key_row, internal_user)
 
     assert removed.value.status_code == 403
+
+def _budget_validation_prisma():
+    from unittest.mock import AsyncMock, MagicMock
+
+    prisma = MagicMock()
+    prisma.db.litellm_budgettable.find_unique = AsyncMock(return_value=None)
+    return prisma
+
+async def test_budget_id_attach_requires_proxy_admin(route_label):
+    """A non-admin caller pointing a key at an admin-created LiteLLM_BudgetTable
+    row inherits that row's limits (the auth-time join), escaping both their
+    per-key ceiling and their team's reservation. Parity with the existing
+    end_user_budget_id gate (R1-H3)."""
+    from fastapi import HTTPException
+    from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _validate_budget_id_change,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await _validate_budget_id_change(
+            requested_budget_id="foreign-budget-1",
+            existing_budget_id=None,
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.INTERNAL_USER, api_key="sk-alice", user_id="alice"
+            ),
+            prisma_client=_budget_validation_prisma(),
+        )
+    assert int(getattr(exc.value, "status_code", 0)) == 403
+    assert "Only proxy admins can set budget_id" in str(exc.value.detail)
+
+async def test_budget_id_attach_existing_budget_kept_without_admin_check():
+    """Unchanged budget_id stays self-serviceable (no 403)."""
+    from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _validate_budget_id_change,
+    )
+
+    result = await _validate_budget_id_change(
+        requested_budget_id="existing-budget",
+        existing_budget_id="existing-budget",
+        user_api_key_dict=UserAPIKeyAuth(
+            user_role=LitellmUserRoles.INTERNAL_USER, api_key="sk-alice", user_id="alice"
+        ),
+        prisma_client=_budget_validation_prisma(),
+    )
+    assert result is None
