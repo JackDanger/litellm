@@ -769,7 +769,6 @@ class LiteLLMRoutes(enum.Enum):
 
     public_routes = frozenset(
         (
-            "/routes",
             "/",
             "/health/liveliness",
             "/health/liveness",
