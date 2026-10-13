@@ -3518,6 +3518,7 @@ async def openai_proxy_route(
 
     [Docs](https://docs.litellm.ai/docs/pass_through/openai_passthrough)
     """
+    openai_proxy_gate(user_api_key_dict=user_api_key_dict, endpoint_path=f"/{endpoint}")
     base_target_url: Final = os.getenv("OPENAI_API_BASE") or "https://api.openai.com/"
     openai_api_key: Final = await _openai_passthrough_credential(base_target_url)
     if openai_api_key is None:
@@ -3919,6 +3920,42 @@ async def deepgram_speak_websocket_route(
 
 _OPENAI_BETA_HEADER: Final = "openai-beta"
 _CLIENT_OPENAI_BETA_RESOURCES: Final = frozenset({"agents", "vaults", "chatkit"})
+_OPENAI_PASSTHROUGH_MANAGEMENT_PREFIXES: Final[tuple[str, ...]] = (
+    "/v1/files",
+    "/v1/batches",
+    "/v1/vector_stores",
+    "/v1/fine_tuning",
+    "/v1/threads",
+    "/v1/assistants",
+    "/v1/models",
+)
+
+
+def openai_proxy_gate(
+    *,
+    user_api_key_dict: UserAPIKeyAuth,
+    endpoint_path: str,
+) -> None:
+    """(R2-3) The /openai passthrough speaks to the shared OpenAI account with
+    the proxy's credentials. Inference paths stay available to granted keys;
+    object-management paths address the shared account with no tenant records,
+    so they are proxy-admin-only. require_managed_files deployments force
+    native routes that stamp ownership instead."""
+    if is_proxy_admin(user_api_key_dict):
+        return
+    normalized: Final = posixpath.normpath(f"/{endpoint_path.strip('/')}")
+    if normalized.startswith(_OPENAI_PASSTHROUGH_MANAGEMENT_PREFIXES):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": (
+                    "/openai object passthrough targets the proxy's shared provider account "
+                    "and is limited to proxy admin keys. Register files through LiteLLM "
+                    "(use target_model_names) or route your model traffic through the "
+                    "standard LiteLLM endpoints."
+                )
+            },
+        )
 
 
 class BaseOpenAIPassThroughHandler:
