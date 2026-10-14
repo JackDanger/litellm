@@ -714,3 +714,83 @@ async def test_claim_token_fails_open_when_hibp_unreachable(httpx_transport):
 
     assert "token" in result
     prisma.db.litellm_usertable.update.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_get_token_rejects_stale_invite_within_expiry_day():
+    """R2-39: expiry is time-precision, not date granularity — a link that
+    expired five minutes ago is rejected even though the calendar date is
+    the same day (the old `.date()` comparison admitted it all day)."""
+    from litellm.proxy.proxy_server import onboarding
+
+    invite = _make_invite(is_accepted=False, expired=False)
+    # 5 minutes in the past: old date-granular logic expected today = valid
+    invite.expires_at = litellm.utils.get_utc_datetime() - timedelta(minutes=5)
+    prisma = _make_prisma(invite)
+    request = MagicMock()
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", prisma),
+        patch("litellm.proxy.proxy_server.master_key", "sk-test"),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await onboarding(invite_link="invite-abc", request=request)
+
+    assert exc_info.value.status_code == 401
+    assert "expired" in exc_info.value.detail["error"]
+
+
+@pytest.mark.asyncio
+async def test_login_code_replay_claimed_across_two_exchanges(monkeypatch):
+    """R2-39: exchange claims the code (SET NX) BEFORE reading it, so a second
+    request cannot redeem a code that has not yet been deleted."""
+    from unittest.mock import MagicMock, patch
+
+    from litellm.proxy._types import ProxyException
+    from litellm.proxy import proxy_server as proxy_server_module
+    from litellm.proxy.proxy_server import login_v3_exchange
+
+    class _RedisWithClaim:
+        def __init__(self) -> None:
+            self.store: dict[str, object] = {}
+            self.claims: set[str] = set()
+
+        async def async_set_cache(self, key, value, ttl=None, nx=False):
+            if nx:
+                if key in self.claims:
+                    return False
+                self.claims.add(key)
+                self.store[key] = True
+                return True
+            self.store[key] = value
+            return True
+
+        async def async_get_cache(self, key):
+            return self.store.get(key)
+
+        async def async_delete_cache(self, key):
+            self.store.pop(key, None)
+
+    redis_layer = _RedisWithClaim()
+    redis_layer.store["login_code:the-code"] = {"token": "jwt-token", "redirect_url": "https://ui.example.com/ui"}
+    dual = MagicMock()
+    dual.redis_cache = redis_layer
+    dual.async_get_cache = redis_layer.async_get_cache
+    dual.async_delete_cache = redis_layer.async_delete_cache
+
+    async def json_body():
+        return {"code": "the-code"}
+
+    request = MagicMock()
+    request.json = json_body
+
+    monkeypatch.setattr(proxy_server_module, "redis_usage_cache", dual)
+    monkeypatch.setattr(proxy_server_module, "general_settings", {"control_plane_url": "https://cp.example"})
+
+    with patch("litellm.proxy.management_endpoints.ui_sso.set_session_token_cookie"):
+        body = await login_v3_exchange(request=request)
+        assert body.body == b'{"token":"jwt-token","redirect_url":"https://ui.example.com/ui"}'
+
+        with pytest.raises(ProxyException) as replay:
+            await login_v3_exchange(request=request)
+    assert int(replay.value.code) == 401

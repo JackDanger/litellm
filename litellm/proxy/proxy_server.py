@@ -19709,6 +19709,9 @@ async def login_v3(request: Request):
             )
 
 
+_login_code_exchange_lock: Final = asyncio.Lock()
+
+
 @router.post("/v3/login/exchange", include_in_schema=False)  # exchange single-use opaque code for JWT
 async def login_v3_exchange(request: Request):
     from litellm.proxy.management_endpoints.ui_sso import set_session_token_cookie
@@ -19733,11 +19736,36 @@ async def login_v3_exchange(request: Request):
             )
 
         cache_key: Final = f"login_code:{code}"
-        cached_data: Final[object] = _UNTYPED_VALUE.validate_python(
-            await redis_usage_cache.async_get_cache(key=cache_key)
-            if redis_usage_cache is not None
-            else await user_api_key_cache.async_get_cache(key=cache_key)
+        # single-use is enforced atomically: a SET NX claim happens BEFORE the
+        # read, so two concurrent exchanges cannot both redeem one code (R2-39)
+        claimed: Final = (
+            await redis_usage_cache.redis_cache.async_set_cache(
+                key=f"login_code_claim:{code}", value=True, ttl=60, nx=True
+            )
+            if redis_usage_cache is not None and redis_usage_cache.redis_cache is not None
+            else None
         )
+        if claimed is False:
+            raise ProxyException(
+                message="Invalid or expired login code",
+                type=ProxyErrorTypes.auth_error,
+                param="code",
+                code=status.HTTP_401_UNAUTHORIZED,
+            )
+        in_memory_exchange: Final = not (
+            redis_usage_cache is not None and redis_usage_cache.redis_cache is not None
+        )
+        if in_memory_exchange:
+            # no redis anywhere: the single event loop serializes redemption with
+            # the same asyncio lock rather than relying on await boundaries
+            async with _login_code_exchange_lock:
+                cached_data: Final[object] = _UNTYPED_VALUE.validate_python(
+                    await user_api_key_cache.async_get_cache(key=cache_key)
+                )
+        else:
+            cached_data = _UNTYPED_VALUE.validate_python(
+                await redis_usage_cache.async_get_cache(key=cache_key)
+            )
 
         if not cached_data or not isinstance(cached_data, dict):
             raise ProxyException(
@@ -19807,9 +19835,11 @@ async def onboarding(invite_link: str, request: Request):
         raise HTTPException(status_code=401, detail={"error": "Invitation link does not exist in db."})
     #### CHECK IF EXPIRED
     # Extract the date part from both datetime objects
-    utc_now_date: Final = litellm.utils.get_utc_datetime().date()
-    expires_at_date: Final = invite_obj.expires_at.date()
-    if expires_at_date < utc_now_date:
+    # R2-39: expiry at time precision (date-granularity extended an expired
+    # invite through its final day)
+    utc_now: Final = litellm.utils.get_utc_datetime()
+    expires_at: Final = invite_obj.expires_at
+    if expires_at < utc_now:
         raise HTTPException(status_code=401, detail={"error": "Invitation link has expired."})
 
     #### CHECK IF ALREADY USED
@@ -20004,9 +20034,11 @@ async def claim_onboarding_link(data: InvitationClaim, request: Request):
         raise HTTPException(status_code=401, detail={"error": "Invitation link does not exist in db."})
     #### CHECK IF EXPIRED
     # Extract the date part from both datetime objects
-    utc_now_date: Final = litellm.utils.get_utc_datetime().date()
-    expires_at_date: Final = invite_obj.expires_at.date()
-    if expires_at_date < utc_now_date:
+    # R2-39: expiry at time precision (date-granularity extended an expired
+    # invite through its final day)
+    utc_now: Final = litellm.utils.get_utc_datetime()
+    expires_at: Final = invite_obj.expires_at
+    if expires_at < utc_now:
         raise HTTPException(status_code=401, detail={"error": "Invitation link has expired."})
 
     #### CHECK IF ALREADY USED
