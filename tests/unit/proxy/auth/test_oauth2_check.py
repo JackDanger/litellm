@@ -53,8 +53,10 @@ async def _run_check(monkeypatch, active: bool | None, captured: dict | None = N
 def test_introspection_active_false_is_rejected(monkeypatch):
     with pytest.raises(Exception) as exc:
         asyncio.run(_run_check(monkeypatch, active=False, captured={}))
-    assert "active" in str(exc.value) and "400" in str(getattr(exc.value, "status_code", 400)) or "400" in str(
-        getattr(exc.value, "detail", "")
+    assert (
+        "active" in str(exc.value)
+        and "400" in str(getattr(exc.value, "status_code", 400))
+        or "400" in str(getattr(exc.value, "detail", ""))
     )
 
 
