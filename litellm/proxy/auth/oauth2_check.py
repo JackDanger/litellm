@@ -181,14 +181,20 @@ class Oauth2Handler:
             # If we get here, the request was successful
             data = response.json()
 
+            # Shape, not contents: the verifier's R1-L2 probe shows a raw IdP
+            # response body at DEBUG leaks claim values verbatim (R1-L2).
             verbose_proxy_logger.debug(
-                "Oauth2 token validation for token=%s, response from endpoint=%s",
-                token,
-                data,
+                "Oauth2 token validation response received: endpoint kind=%s, active_present=%s, subject_present=%s",
+                "introspection" if is_introspection_endpoint else "token_info",
+                data.get("active") is True,
+                bool(data.get("sub")),
             )
 
-            # For introspection endpoints, check if token is active
-            if is_introspection_endpoint and not data.get("active", True):
+            # For introspection endpoints, check if token is active. RFC 7662
+            # requires an explicit active flag; treating a missing one as
+            # valid would validate any token whenever the IdP response is
+            # degraded (LD fork hardening R1-L1)
+            if is_introspection_endpoint and data.get("active") is not True:
                 raise ValueError("Token is not active")
 
             # Extract user information from response
