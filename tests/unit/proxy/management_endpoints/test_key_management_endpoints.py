@@ -23121,7 +23121,11 @@ async def test_generate_key_metadata_budget_authority_allowed_for_admin():
             litellm_changed_by=None,
             team_table=None,
         )
-    assert mock_generate_key.called
+        assert mock_generate_key.called
+    observed: Final = str(mock_generate_key.call_args)
+    # the observable: the admin-approved request (temp-budget metadata style)
+    # survived the whole helper pipeline without a non-admin gate rejection
+    assert "temp_budget_increase" in observed
 
 
 class TestKeyUpdateBudgetAuthorityGates:
@@ -23243,18 +23247,20 @@ async def test_key_regeneration_budget_change_requires_admin(monkeypatch):
     )
 
     monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", _make_regenerate_mock_prisma())
-    admin_check = AsyncMock(return_value=None)
-    monkeypatch.setattr(
-        "litellm.proxy.management_endpoints.key_management_endpoints._check_key_admin_access",
-        admin_check,
-    )
-
     existing_key = _make_regenerate_existing_key()
     user_api_key_cache = UserApiKeyCache()
     caller = UserAPIKeyAuth(
         user_role=LitellmUserRoles.INTERNAL_USER,
         api_key="sk-alice",
         user_id="user-1",
+    )
+
+    # The real _check_key_admin_access runs: its lookup resolves the target key
+    # through the mocked prisma client, its team step is skipped because the key
+    # has no team, and the internal user is told the route is admin-only.
+    prisma_client = _make_regenerate_mock_prisma()
+    prisma_client.db.litellm_verificationtoken.find_unique = AsyncMock(
+        return_value=_make_regenerate_existing_key()
     )
 
     with (
@@ -23275,22 +23281,23 @@ async def test_key_regeneration_budget_change_requires_admin(monkeypatch):
             "litellm.proxy.management_endpoints.key_management_endpoints.KeyManagementEventHooks.async_key_rotated_hook"
         ),
     ):
-        await _execute_virtual_key_regeneration(
-            prisma_client=_make_regenerate_mock_prisma(),
-            key_in_db=existing_key,
-            hashed_api_key="abc123",
-            key="abc123",
-            data=RegenerateKeyRequest(spend=0.0, max_budget=100000.0),
-            user_api_key_dict=caller,
-            litellm_changed_by=None,
-            user_api_key_cache=user_api_key_cache,
-            proxy_logging_obj=AsyncMock(),
-        )
+        with pytest.raises(HTTPException) as exc:
+            await _execute_virtual_key_regeneration(
+                prisma_client=prisma_client,
+                key_in_db=existing_key,
+                hashed_api_key="abc123",
+                key="abc123",
+                data=RegenerateKeyRequest(spend=0.0, max_budget=100000.0),
+                user_api_key_dict=caller,
+                litellm_changed_by=None,
+                user_api_key_cache=user_api_key_cache,
+                proxy_logging_obj=AsyncMock(),
+            )
 
-    assert admin_check.called
-    assert (
-        "/key/regenerate (max_budget/spend)" in admin_check.call_args.kwargs["route"]
-    )
+    # The caller observes the rejection itself: a budget-moving regenerate for a
+    # non-admin cannot silently reset spend or lift max_budget.
+    assert int(getattr(exc.value, "status_code", 0)) == 403
+    assert "/key/regenerate (max_budget/spend)" in str(exc.value.detail)
 
 
 @pytest.mark.asyncio

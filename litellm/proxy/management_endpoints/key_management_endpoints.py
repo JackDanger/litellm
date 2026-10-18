@@ -934,7 +934,7 @@ def _strip_non_admin_changed_by_metadata(
     audit rows, so a self-granted flag lets any key holder forge the primary
     audit attribution field. Silently stripped for non-admin writes.
     """
-    metadata = data.metadata
+    metadata: Final = data.metadata
     if not isinstance(metadata, dict):
         return
     if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN.value:
