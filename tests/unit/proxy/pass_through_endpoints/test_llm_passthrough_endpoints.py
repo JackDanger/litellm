@@ -221,9 +221,7 @@ async def test_gemini_pass_through_endpoint_forwards_key_and_body(
 
     monkeypatch.setenv("GEMINI_API_KEY", "gemini-test-key")
     endpoint: Final = "v1beta/models/gemini-2.5-flash:countTokens"
-    upstream: Final = respx_mock.post(
-        url__startswith=f"https://generativelanguage.googleapis.com/{endpoint}"
-    ).mock(
+    upstream: Final = respx_mock.post(url__startswith=f"https://generativelanguage.googleapis.com/{endpoint}").mock(
         return_value=httpx.Response(
             200,
             json={"totalTokens": 9},
@@ -446,7 +444,6 @@ def test_vertex_pass_through_drops_the_configured_anthropic_beta_before_calling_
     assert json.loads(outbound.content) == _VERTEX_CLAUDE_BODY
 
 
-
 @pytest.mark.parametrize(
     "configured",
     [[f" {_VERTEX_REJECTED_BETA} "], [f"{_VERTEX_REJECTED_BETA},afk-mode-2026-01-31"]],
@@ -474,6 +471,7 @@ def test_vertex_pass_through_matches_a_configured_beta_written_the_way_the_heade
 
     assert (response.status_code, response.json()) == (200, _VERTEX_CLAUDE_REPLY)
     assert upstream.calls.last.request.headers["anthropic-beta"] == "claude-code-20250219,effort-2025-11-24"
+
 
 def test_vertex_pass_through_refuses_a_malformed_drop_setting_without_calling_vertex(
     vertex_proxy: TestClient, respx_mock: "respx.MockRouter", monkeypatch: pytest.MonkeyPatch
