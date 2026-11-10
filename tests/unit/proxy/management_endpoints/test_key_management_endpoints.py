@@ -24618,3 +24618,34 @@ def test_user_new_without_a_key_does_not_check_guardrail_names(spend_permission_
 
     assert response.status_code == 200, response.text
     find_many.assert_not_awaited()
+
+
+def test_budget_authority_metadata_rejected_for_non_admin():
+    """The free-form metadata dict must not carry budget authority past the
+    typed gates: temp_budget_* lifts the effective max_budget at auth time
+    and a metadata throttle flag flips a hard block into a throttled
+    continue. Both fields are proxy-admin-only."""
+    import pytest as _pytest
+    from fastapi import HTTPException
+    from litellm.proxy._types import KeyRequestBase, UserAPIKeyAuth, LitellmUserRoles
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _reject_non_admin_budget_authority_metadata,
+    )
+
+    data = KeyRequestBase(metadata={"temp_budget_increase": 999999})
+    with _pytest.raises(HTTPException) as exc:
+        _reject_non_admin_budget_authority_metadata(
+            data=data,
+            existing_metadata=None,
+            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.INTERNAL_USER, api_key="sk-x"),
+        )
+    assert int(getattr(exc.value, "status_code", 0)) == 403
+
+    data2 = KeyRequestBase(metadata={"throttle_on_budget_exceeded": True})
+    with _pytest.raises(HTTPException) as exc2:
+        _reject_non_admin_budget_authority_metadata(
+            data=data2,
+            existing_metadata={},
+            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.INTERNAL_USER, api_key="sk-x"),
+        )
+    assert int(getattr(exc2.value, "status_code", 0)) == 403

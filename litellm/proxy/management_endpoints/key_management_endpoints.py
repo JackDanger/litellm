@@ -1528,6 +1528,11 @@ async def _common_key_generation_helper(
             status_code=403,
             detail={"error": "Only proxy admins can enable throttle_on_budget_exceeded on a key."},
         )
+    _reject_non_admin_budget_authority_metadata(
+        data=data,
+        existing_metadata=None,
+        user_api_key_dict=user_api_key_dict,
+    )
 
     await _validate_end_user_budget_id_change(
         requested_budget_id=_requested_end_user_budget_id(data),
@@ -3650,6 +3655,46 @@ def _requested_end_user_budget_id(data: KeyRequestBase) -> str | None:
     return get_key_end_user_budget_id(data.metadata) or ""
 
 
+_TEMP_BUDGET_METADATA_KEYS: Final[frozenset[str]] = frozenset(
+    {"temp_budget_increase", "temp_budget_expiry"}
+)
+
+
+def _reject_non_admin_budget_authority_metadata(
+    *,
+    data: KeyRequestBase,
+    existing_metadata: Mapping[str, object] | None,
+    user_api_key_dict: UserAPIKeyAuth,
+) -> None:
+    """Reject metadata that grants budget authority to a non-admin caller.
+
+    temp_budget_increase/temp_budget_expiry lift the effective max_budget at
+    auth time and a metadata-borne throttle_on_budget_exceeded flips a
+    hard-blocked over-budget key into throttled-continue. The equivalent typed
+    request fields are already admin-gated; without this check the same
+    values ride the free-form metadata dict past those gates.
+    """
+    incoming: Final = data.metadata if isinstance(data.metadata, Mapping) else {}
+    existing: Final = existing_metadata if isinstance(existing_metadata, Mapping) else {}
+    if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN.value:
+        return
+    sets_temp_budget: Final = any(key in incoming for key in _TEMP_BUDGET_METADATA_KEYS)
+    incoming_throttle: Final = incoming.get("throttle_on_budget_exceeded")
+    existing_throttle: Final = existing.get("throttle_on_budget_exceeded")
+    escalates_throttle: Final = incoming_throttle is True and existing_throttle is not True
+    if not (sets_temp_budget or escalates_throttle):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "error": (
+                "Only proxy admins can set budget authority fields in key metadata "
+                "(temp_budget_increase, temp_budget_expiry, throttle_on_budget_exceeded)."
+            )
+        },
+    )
+
+
 async def _validate_end_user_budget_id_change(
     requested_budget_id: str | None,
     existing_budget_id: str | None,
@@ -3887,6 +3932,11 @@ async def _validate_update_key_data(
             status_code=403,
             detail={"error": "Only proxy admins can enable throttle_on_budget_exceeded on a key."},
         )
+    _reject_non_admin_budget_authority_metadata(
+        data=data,
+        existing_metadata=_existing_metadata,
+        user_api_key_dict=user_api_key_dict,
+    )
 
     await _validate_end_user_budget_id_change(
         requested_budget_id=_requested_end_user_budget_id(data),
