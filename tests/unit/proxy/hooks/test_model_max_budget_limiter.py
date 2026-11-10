@@ -1031,3 +1031,36 @@ async def test_concurrent_first_charges_on_one_replica_both_count():
         shared_windows=_WindowSpendDatabase().replica(),
     )
     assert usage["claude-opus*"]["current_spend"] == round(CHAT_COST * 2, 4)
+
+
+@pytest.mark.asyncio
+async def test_redis_outage_strict_spend_read_raises_when_fail_closed(monkeypatch):
+    """R2-11: under fail_closed_rate_limit_enforcement, a Redis outage must
+    raise RateLimitUnverifiableError instead of reading as zero spend."""
+    from unittest.mock import AsyncMock
+
+    import litellm
+    from litellm.caching import DualCache
+    from litellm.proxy.hooks.model_max_budget_limiter import (
+        _PROXY_VirtualKeyModelMaxBudgetLimiter,
+    )
+    from litellm.proxy.hooks.parallel_request_limiter_v3 import RateLimitUnverifiableError
+
+    class _ExplodingRedis:
+        async def async_get_cache(self, key, strict=False):
+            if strict:
+                raise ConnectionError("redis unreachable")
+            return None
+
+    limiter = _PROXY_VirtualKeyModelMaxBudgetLimiter(
+        dual_cache=DualCache(redis_cache=_ExplodingRedis())
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.hooks.model_max_budget_limiter._fail_closed_rate_limit_enforcement_enabled",
+        lambda: True,
+    )
+    try:
+        await limiter._cached_spend("provider_spend:openai:1d")
+        raise AssertionError("fail-closed must raise on a strict read failure")
+    except RateLimitUnverifiableError:
+        pass
