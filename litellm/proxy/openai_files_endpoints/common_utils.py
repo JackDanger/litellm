@@ -692,6 +692,24 @@ def get_team_provider_credentials(
     )
     return None if resolved is None else dict(resolved.credentials)
 
+def get_team_provider_credentials_with_scope(
+    llm_router: Optional["Router"],
+    user_api_key_dict: "UserAPIKeyAuth",
+    custom_llm_provider: str,
+) -> "tuple[dict, bool] | None":
+    """(R2-1/R2-2) Like get_team_provider_credentials, but also reports whether
+    the credentials are TENANT-SCOPED: True only when they came from the
+    caller's OWN team's BYOK deployment. A shared deployment the caller may
+    call is not one it owns — its provider account is not tenant-scoped, and
+    raw-id guards consuming this must not treat its merge as one."""
+    resolved: Final = _resolve_provider_credentials(
+        llm_router, user_api_key_dict, custom_llm_provider, include_accessible_deployments=True
+    )
+    if resolved is None:
+        return None
+    return dict(resolved.credentials), isinstance(resolved, TeamProviderDeployment)
+
+
 
 def get_team_provider_deployment(
     llm_router: Optional["Router"],
@@ -884,7 +902,7 @@ def apply_team_provider_credentials(
     llm_router: Optional["Router"],
     user_api_key_dict: "UserAPIKeyAuth",
     custom_llm_provider: str,
-) -> None:
+) -> bool:
     """
     Resolve credentials for a provider-only request (no model pinned) via
     ``get_team_provider_credentials`` and merge them into ``data`` in-place.
@@ -894,14 +912,16 @@ def apply_team_provider_credentials(
     ``forward_llm_provider_auth_headers``) replaces the deployment's, and the
     request's ``api_base`` replaces the deployment's only alongside that key.
     """
-    credentials: Final = get_team_provider_credentials(
+    resolved: Final = get_team_provider_credentials_with_scope(
         llm_router=llm_router,
         user_api_key_dict=user_api_key_dict,
         custom_llm_provider=custom_llm_provider,
     )
-    if credentials is None:
-        return
+    if resolved is None:
+        return False
+    credentials, team_owned = resolved
     prepare_data_with_credentials(data=data, credentials={**credentials, **explicit_request_credentials(data)})
+    return team_owned
 
 
 def add_deployment_model_info(

@@ -963,6 +963,46 @@ async def create_file(
     dependencies=[Depends(user_api_key_auth)],
     tags=["files"],
 )
+def assert_raw_object_access_is_admin_only(
+    user_api_key_dict: UserAPIKeyAuth,
+    resource_id: str,
+    managed_hook: object | None,
+    tenant_credentials_merged: bool = False,
+) -> None:
+    """(R2-1) A raw provider id forwarded under shared credentials reaches the
+    object of whichever tenant that id belongs to. Unless the deployment
+    requiring managed ids is enabled, the caller resolves tenant-scoped
+    credentials, or a LICENSED managed-files hook owns the rule, raw-id
+    content, retrieve and delete are proxy-admin-only."""
+    from litellm.proxy._types import LitellmUserRoles
+    from litellm.proxy.proxy_server import premium_user
+
+    if user_api_key_dict.user_role in (
+        LitellmUserRoles.PROXY_ADMIN,
+        LitellmUserRoles.PROXY_ADMIN_VIEW_ONLY,
+    ):
+        return
+    if tenant_credentials_merged:
+        return
+    if is_base64_encoded_unified_file_id(resource_id):
+        return
+    if managed_hook is not None and premium_user is True:
+        # a LICENSED enterprise managed-files hook enforces raw-id ownership
+        # itself; an unlicensed one registers but enforces nothing (live
+        # red-team finding), so presence alone does not pass
+        return
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "error": (
+                "Raw provider object ids are restricted to proxy admins (they address "
+                "objects belonging to whichever tenant created them); serve your keys' "
+                "files through LiteLLM managed ids."
+            )
+        },
+    )
+
+
 async def get_file_content(
     request: Request,
     fastapi_response: Response,
@@ -1128,12 +1168,20 @@ async def get_file_content(
                 check_file_id_encoding=True,
             )
 
-            if not should_route:
+            team_credentials_merged: Final = bool(
                 apply_team_provider_credentials(
                     data=data,
                     llm_router=llm_router,
                     user_api_key_dict=user_api_key_dict,
                     custom_llm_provider=custom_llm_provider,
+                )
+            )
+            if not should_route:
+                assert_raw_object_access_is_admin_only(
+                    user_api_key_dict=user_api_key_dict,
+                    resource_id=file_id,
+                    managed_hook=proxy_logging_obj.get_proxy_hook("managed_files"),
+                    tenant_credentials_merged=team_credentials_merged,
                 )
 
             from litellm.proxy.openai_files_endpoints.file_content_streaming_handler import (
@@ -1393,11 +1441,20 @@ async def get_file(
             # Remove file_id from data to avoid "multiple values for keyword argument" error
             # data was initialized with {"file_id": file_id}
             data.pop("file_id", None)
-            apply_team_provider_credentials(
-                data=data,
-                llm_router=llm_router,
+            # (R2-1) only a TEAM-OWNED deployment's credential merge is tenant-scoped
+            team_credentials_merged: Final = bool(
+                apply_team_provider_credentials(
+                    data=data,
+                    llm_router=llm_router,
+                    user_api_key_dict=user_api_key_dict,
+                    custom_llm_provider=custom_llm_provider,
+                )
+            )
+            assert_raw_object_access_is_admin_only(
                 user_api_key_dict=user_api_key_dict,
-                custom_llm_provider=custom_llm_provider,
+                resource_id=file_id,
+                managed_hook=proxy_logging_obj.get_proxy_hook("managed_files"),
+                tenant_credentials_merged=team_credentials_merged,
             )
             response = await litellm.afile_retrieve(
                 custom_llm_provider=custom_llm_provider,
@@ -1611,11 +1668,19 @@ async def delete_file(
             )
         else:
             data.pop("file_id", None)
-            apply_team_provider_credentials(
-                data=data,
-                llm_router=llm_router,
+            team_credentials_merged: Final = bool(
+                apply_team_provider_credentials(
+                    data=data,
+                    llm_router=llm_router,
+                    user_api_key_dict=user_api_key_dict,
+                    custom_llm_provider=custom_llm_provider,
+                )
+            )
+            assert_raw_object_access_is_admin_only(
                 user_api_key_dict=user_api_key_dict,
-                custom_llm_provider=custom_llm_provider,
+                resource_id=file_id,
+                managed_hook=proxy_logging_obj.get_proxy_hook("managed_files"),
+                tenant_credentials_merged=team_credentials_merged,
             )
             response = await litellm.afile_delete(
                 custom_llm_provider=custom_llm_provider,
