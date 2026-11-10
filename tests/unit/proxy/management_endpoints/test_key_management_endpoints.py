@@ -24495,3 +24495,34 @@ def test_budget_authority_metadata_rejected_for_non_admin():
             user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.INTERNAL_USER, api_key="sk-x"),
         )
     assert int(getattr(exc2.value, "status_code", 0)) == 403
+
+
+def test_regenerate_budget_change_rejected_for_non_admin():
+    """R2-6 canary: /key/regenerate must enforce the same budget-authority
+    gate as /key/update — a key owner regenerating their own key cannot
+    reprice it (max_budget/spend/budget_duration) past the ceilings."""
+    import inspect
+    from unittest.mock import MagicMock
+
+    import litellm.proxy.management_endpoints.key_management_endpoints as km
+    from litellm.proxy._types import UpdateKeyRequest, UserAPIKeyAuth, LitellmUserRoles
+
+    key_info = MagicMock()
+    key_info.user_id = "owner-1"
+    key_info.max_budget = 10.0
+    key_info.spend = 0.0
+    key_info.budget_duration = None
+
+    data = UpdateKeyRequest(key="sk-whatever", max_budget=99999.0)
+    change = km.classify_key_budget_change(data=data, existing=key_info)
+    assert not isinstance(change, km.KeyBudgetUnchanged), "a repriced max_budget is a budget change"
+
+    caller = UserAPIKeyAuth(user_role=LitellmUserRoles.INTERNAL_USER, api_key="sk-owner")
+    assert caller.user_role != LitellmUserRoles.PROXY_ADMIN.value
+
+    # wiring: the regenerate flow carries both gates
+    regenerate_src = inspect.getsource(km.regenerate_key_fn)
+    assert "classify_key_budget_change" in regenerate_src, "the regenerate path must run the classify gate"
+    assert "_reject_non_admin_budget_authority_metadata" in regenerate_src, (
+        "the regenerate path must run the metadata-authority gate"
+    )
