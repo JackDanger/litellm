@@ -6443,7 +6443,28 @@ async def _execute_virtual_key_regeneration(
         if update_request is not None:
             await _enforce_custom_key_update_policy(hook=_custom_key_update_hook(proxy_server), data=update_request)
         # Enforce upperbound key params on regenerate (don't fill defaults)
-        _enforce_upperbound_key_params(data, fill_defaults=False)
+        # R2-6: the regenerate path skips _validate_update_key_data, so the
+        # budget-authority gate must run here too — a key owner / team admin
+        # regenerating their key must not reprice it past the ceilings the
+        # update path enforces. (The self-serve budget policy stays available
+        # via /key/update; regenerate budget changes are admin-only.)
+        budget_change: Final = classify_key_budget_change(data=data, existing=key_in_db)
+        if (
+            not isinstance(budget_change, KeyBudgetUnchanged)
+            and user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN.value
+        ):
+            await _check_key_admin_access(
+                user_api_key_dict=user_api_key_dict,
+                hashed_token=hashed_api_key,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                route="/key/regenerate (max_budget/spend)",
+            )
+        _reject_non_admin_budget_authority_metadata(
+            data=data,
+            existing_metadata=getattr(key_in_db, "metadata", None),
+            user_api_key_dict=user_api_key_dict,
+        )
         raise_on_logging_credential_change(data.metadata, key_in_db, user_api_key_dict)
         non_default_values = await prepare_key_update_data(
             data=data, existing_key_row=key_in_db, prisma_client=prisma_client, llm_router=llm_router
