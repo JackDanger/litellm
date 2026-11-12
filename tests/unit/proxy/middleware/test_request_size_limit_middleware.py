@@ -242,3 +242,32 @@ async def test_chunked_upload_overflow_stops_fastapi_and_auth_multipart_parsing(
 
     assert response.status_code == 413
     assert response.json() == {"detail": "Request size is too large. Max size is 0.0009765625 MB"}
+
+
+def test_production_wiring_arms_the_cap_on_the_config_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The deployment's configured cap must hold without any license state:
+    a profile that pins `max_request_size_mb` enforces it, and a deployment
+    that pins nothing keeps passing through."""
+    import litellm.proxy.proxy_server as proxy_server_module
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        raise AssertionError("downstream must not run under an oversized request")
+
+    monkeypatch.setattr(proxy_server_module, "general_settings", {"max_request_size_mb": 1})
+    middleware = proxy_server_module.RequestSizeLimitMiddleware(
+        app,
+        get_max_request_size_mb=proxy_server_module.configured_max_request_size_mb,
+        is_request_size_limit_enabled=lambda: proxy_server_module.configured_max_request_size_mb() is not None,
+        route_max_request_size_mb=None,
+    )
+    client = TestClient(middleware)
+    response = client.post(
+        "/chat/completions",
+        content=b"x" * (2 * 1024 * 1024 + 1),
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 413
+    assert response.json() == {"error": "Request size is too large. Max size is 1 MB"}
+
+    monkeypatch.setattr(proxy_server_module, "general_settings", {})
+    assert proxy_server_module.configured_max_request_size_mb() is None

@@ -2999,7 +2999,7 @@ _ROUTE_MAX_REQUEST_SIZE_MB: Final[Mapping[tuple[str, str], float]] = MappingProx
 
 app.add_middleware(
     RequestBodyDecompressionMiddleware,
-    get_max_request_size_mb=lambda: configured_max_request_size_mb() if premium_user is True else None,
+    get_max_request_size_mb=lambda: configured_max_request_size_mb(),
     route_max_request_size_mb=_ROUTE_MAX_REQUEST_SIZE_MB,
 )
 app.add_middleware(
@@ -22627,7 +22627,7 @@ app.router.routes = hot_routes_first(app.router.routes)
 app.add_middleware(
     RequestSizeLimitMiddleware,
     get_max_request_size_mb=configured_max_request_size_mb,
-    is_request_size_limit_enabled=lambda: premium_user is True,
+    is_request_size_limit_enabled=lambda: configured_max_request_size_mb() is not None,
     route_max_request_size_mb=_ROUTE_MAX_REQUEST_SIZE_MB,
 )
 app.add_middleware(
