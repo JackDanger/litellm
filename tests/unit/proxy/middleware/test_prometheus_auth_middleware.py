@@ -3,14 +3,14 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import litellm
-from litellm.proxy._types import SpecialHeaders
+from litellm.proxy._types import LitellmUserRoles, SpecialHeaders, UserAPIKeyAuth
 from litellm.proxy.middleware.prometheus_auth_middleware import PrometheusAuthMiddleware
 
 
 # Fake auth functions to simulate valid and invalid auth behavior.
 async def fake_valid_auth(request, api_key, **kwargs):
-    # Simulate valid authentication: do nothing (i.e. pass)
-    return
+    # Simulate valid authentication with an assigned role (i.e. pass)
+    return UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN)
 
 
 async def fake_valid_auth_reads_body(request, api_key, **kwargs):
@@ -19,7 +19,13 @@ async def fake_valid_auth_reads_body(request, api_key, **kwargs):
     for successful auth passing a drained receive to the inner app (hang).
     """
     await request.body()
-    return
+    return UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN)
+
+
+async def fake_roleless_auth(request, api_key, **kwargs):
+    # Simulate valid auth for a key with no assigned role, the shape of a
+    # leaked inference key that is not an operator key.
+    return UserAPIKeyAuth(user_role=None)
 
 
 async def fake_invalid_auth(request, api_key, **kwargs):
@@ -108,6 +114,26 @@ def test_valid_auth_metrics(app_with_middleware, monkeypatch):
     response = client.get("/metrics/", headers=headers)
     assert response.status_code == 200, response.text
     assert response.json() == {"msg": "metrics OK"}
+
+
+def test_roleless_auth_metrics_rejected(app_with_middleware, monkeypatch):
+    """
+    A key that authenticates but has no assigned role must not scrape /metrics:
+    the labels embed user_email, api_key_alias, team, client_ip and api_base,
+    which enumerate identities and internal hosts.
+    """
+    monkeypatch.setattr(litellm, "require_auth_for_metrics_endpoint", True)
+    monkeypatch.setattr(
+        "litellm.proxy.middleware.prometheus_auth_middleware.user_api_key_auth",
+        fake_roleless_auth,
+    )
+
+    client = TestClient(app_with_middleware)
+    headers = {SpecialHeaders.openai_authorization.value: "valid"}
+
+    response = client.get("/metrics", headers=headers)
+    assert response.status_code == 401, response.text
+    assert "assigned role" in response.text
 
 
 def test_invalid_auth_metrics(app_with_middleware, monkeypatch):

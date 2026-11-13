@@ -62,7 +62,7 @@ class PrometheusAuthMiddleware:
             request: Final = Request(scope, receive_for_auth)
 
             try:
-                await user_api_key_auth(
+                metrics_auth_dict: Final = await user_api_key_auth(
                     request=request,
                     api_key=request.headers.get(_AUTHORIZATION_HEADER) or "",
                     azure_api_key_header=request.headers.get(SpecialHeaders.azure_authorization.value) or "",
@@ -73,6 +73,12 @@ class PrometheusAuthMiddleware:
                     azure_apim_header=request.headers.get(SpecialHeaders.azure_apim_authorization.value) or "",
                     custom_litellm_key_header=request.headers.get(SpecialHeaders.custom_litellm_api_key.value),
                 )
+                # Roleless keys (typical leaked LLM keys) expose identities and
+                # internal hosts through the metric labels; only a key with an
+                # assigned role may scrape.
+                metrics_user_role = getattr(metrics_auth_dict, "user_role", None)
+                if metrics_user_role is None:
+                    raise Exception("Metrics access requires a key with an assigned role")
             except Exception as e:
                 # Send 401 response directly via ASGI protocol
                 error_message: Final = getattr(e, "message", str(e))
