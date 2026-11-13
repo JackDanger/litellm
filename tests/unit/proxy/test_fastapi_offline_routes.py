@@ -56,10 +56,12 @@ class TestFastAPIOfflineRoutes:
         # which would indicate the StaticFiles AttributeError bug
         assert response.status_code != 500, f"Got 500 error: {response.text}"
 
-        # We accept either 200 (success) or 401 (auth required) - both are valid
+        # We accept either 200 (success), 401 (auth required) or 403
+        # (authenticated non-admin) - all are valid
         assert response.status_code in [
             200,
             401,
+            403,
         ], f"Unexpected status: {response.status_code}"
 
         if response.status_code == 200:
@@ -109,10 +111,11 @@ class TestFastAPIOfflineRoutes:
             response = client.get("/routes", headers=headers)
 
             # If authentication is properly mocked, we should get a 200 response
-            # If not, we might get 401, but we should NOT get 500 (AttributeError)
+            # If not, we might get 401 or 403, but we should NOT get 500 (AttributeError)
             assert response.status_code in [
                 200,
                 401,
+                403,
             ], f"Unexpected status code: {response.status_code}"
 
             if response.status_code == 200:

@@ -16,6 +16,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from litellm.proxy._types import LitellmUserRoles
+
 from .conftest import normalize
 
 
@@ -70,6 +72,22 @@ def test_get_routes_returns_routes_list(client, auth_as):
         "has_methods": True,
         "has_endpoint": True,
     }
+
+
+def test_get_routes_non_admin_forbidden(client, auth_as):
+    """Route enumeration is a full attack-surface map: an authenticated
+    non-admin key gets 403, not the route list."""
+    with auth_as(LitellmUserRoles.INTERNAL_USER):
+        response = client.get("/routes")
+    assert response.status_code == 403
+    assert "proxy admins only" in response.json()["detail"]
+
+
+def test_get_routes_view_only_admin_forbidden(client, auth_as):
+    """View-only role also stays out of the enumeration surface."""
+    with auth_as(LitellmUserRoles.PROXY_ADMIN_VIEW_ONLY):
+        response = client.get("/routes")
+    assert response.status_code == 403
 
 
 def test_get_routes_invalid_method_405(client):

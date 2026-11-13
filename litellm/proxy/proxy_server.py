@@ -22504,10 +22504,18 @@ async def get_adaptive_router_state(
 
 
 @router.get("/routes", dependencies=[Depends(user_api_key_auth)])
-async def get_routes():
+async def get_routes(user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth)):
     """
     Get a list of available routes in the FastAPI application.
     """
+    # Route enumeration is a complete attack-surface map, so gate in-handler:
+    # an allowed_routes fall-through would otherwise let any authenticated
+    # key list every registered path.
+    if user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN:
+        raise HTTPException(
+            status_code=403,
+            detail="Route enumeration is available to proxy admins only.",
+        )
     from litellm.proxy.common_utils.get_routes import GetRoutes
 
     routes: Final = []

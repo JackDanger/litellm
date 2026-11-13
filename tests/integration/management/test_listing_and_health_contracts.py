@@ -68,12 +68,11 @@ def test_admin_health_counts_every_deployment_and_reports_a_live_one_healthy(gat
         assert object_value(healthy[0]).get("model_id") == model_id, report
 
 
-def test_routes_listing_is_served_without_credentials(gateway: Gateway) -> None:
+def test_routes_listing_is_not_served_without_credentials(gateway: Gateway) -> None:
     response: Final = gateway.client.get("/routes")
-    assert response.status_code == 200, response.text
-    routes: Final = object_value(response.json())["routes"]
-    assert isinstance(routes, list)
-    assert {"/routes", "/key/generate"} <= {object_value(route)["path"] for route in routes}
+    # Enumeration is admin-only: a credentialless caller is refused before it
+    # can read the registered path list.
+    assert response.status_code in (401, 403), response.text
 
 
 def test_unrestricted_key_lists_models_and_none_when_only_access_groups_are_requested(gateway: Gateway) -> None:
