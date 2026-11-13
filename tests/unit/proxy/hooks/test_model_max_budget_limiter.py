@@ -1031,3 +1031,90 @@ async def test_concurrent_first_charges_on_one_replica_both_count():
         shared_windows=_WindowSpendDatabase().replica(),
     )
     assert usage["claude-opus*"]["current_spend"] == round(CHAT_COST * 2, 4)
+
+
+class _StrictProbeRedis:
+    """Redis double whose read honors the strict-mode contract: a swallowed outage
+    returns None when raise_on_error=False and raises when it is True."""
+
+    def __init__(self, *, value=None):
+        self._value: Final = value
+
+    async def async_get_cache(self, key, *, raise_on_error: bool = False):
+        if raise_on_error:
+            raise ConnectionError("redis unreachable")
+        return self._value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "flag_enabled, expected",
+    [(False, None), (True, 42.0)],
+)
+async def test_spend_read_survives_redis_outage_when_flag_disabled(monkeypatch, flag_enabled, expected):
+    """The spend read degrades to None/zero spend on an outage with the upstream
+    default, and reaches the real value with the flag enabled once Redis answers."""
+    redis: Final = _StrictProbeRedis(value=expected)
+    limiter: Final = PROXY_VirtualKeyModelMaxBudgetLimiter(
+        dual_cache=SimpleNamespace(redis_cache=redis, async_get_cache=None, in_memory_cache=None)
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.hooks.model_max_budget_limiter._fail_closed_rate_limit_enforcement_enabled",
+        lambda: flag_enabled,
+    )
+
+    if flag_enabled:
+        from litellm.proxy.hooks.model_max_budget_limiter import MODEL_BUDGET_UNVERIFIABLE_MESSAGE
+        from litellm.proxy.hooks.parallel_request_limiter_v3 import RateLimitUnverifiableError
+
+        limiter_fail_closed: Final = limiter
+        with pytest.raises(RateLimitUnverifiableError) as excinfo:
+            await limiter_fail_closed._cached_spend(KEY_SPEND_KEY)
+        assert excinfo.value.status_code == 503
+        assert MODEL_BUDGET_UNVERIFIABLE_MESSAGE in excinfo.value.detail["error"]
+    else:
+        assert await limiter._cached_spend(KEY_SPEND_KEY) is None
+
+
+@pytest.mark.asyncio
+async def test_budget_verification_fails_closed_on_outage(monkeypatch):
+    """End to end through the admission path: an outage on the model-spend read
+    surfaces the 503 reject instead of admitting an unverifiable budget."""
+    from litellm.proxy.hooks.parallel_request_limiter_v3 import RateLimitUnverifiableError
+
+    limiter: Final = PROXY_VirtualKeyModelMaxBudgetLimiter(
+        dual_cache=SimpleNamespace(redis_cache=_StrictProbeRedis(), async_get_cache=None, in_memory_cache=None)
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.hooks.model_max_budget_limiter._fail_closed_rate_limit_enforcement_enabled",
+        lambda: True,
+    )
+
+    def fake_resolve_model_budget(model, model_max_budget, model_access_groups=None, team_id=None):
+        return SimpleNamespace(
+            budget_model=model,
+            budget_config=SimpleNamespace(max_budget=10.0, budget_duration="1d"),
+        )
+
+    monkeypatch.setattr(
+        "litellm.proxy.hooks.model_max_budget_limiter.resolve_model_budget",
+        fake_resolve_model_budget,
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.hooks.model_max_budget_limiter.model_budget_spend_cache_key",
+        lambda **kwargs: KEY_SPEND_KEY,
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.hooks.model_max_budget_limiter._legacy_request_model_spend_cache_key",
+        lambda **kwargs: None,
+    )
+
+    with pytest.raises(RateLimitUnverifiableError):
+        await limiter._is_entity_within_model_budget(
+            entity_type=Litellm_EntityType.KEY,
+            entity_id=KEY_HASH,
+            team_id=None,
+            model_max_budget={"gpt-x": {"max_budget": 10, "budget_duration": "1d"}},
+            model="gpt-x",
+            exceeded_message="LiteLLM Virtual Key: exceeded budget for model",
+        )

@@ -317,10 +317,10 @@ RATE_LIMIT_UNVERIFIABLE_MESSAGE: Final = (
 
 
 class RateLimitUnverifiableError(HTTPException):
-    def __init__(self) -> None:
+    def __init__(self, detail_message: str | None = None) -> None:
         super().__init__(
             status_code=HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"error": RATE_LIMIT_UNVERIFIABLE_MESSAGE},
+            detail={"error": detail_message or RATE_LIMIT_UNVERIFIABLE_MESSAGE},
         )
 
 

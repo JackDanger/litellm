@@ -24,6 +24,7 @@ from litellm.proxy.hooks.dynamic_rate_limiter_v3 import (
 )
 from litellm.proxy.hooks.parallel_request_limiter_v3 import (
     PROXY_MaxParallelRequestsHandler_v3,
+    RateLimitUnverifiableError,
 )
 from litellm.redis.stores.rate_limits import RateLimitScope
 from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
@@ -2209,3 +2210,83 @@ async def test_a_websocket_turn_under_the_teams_max_borrow_multiple_still_borrow
     handler = _borrowing_handler(monkeypatch, borrows=True, saturation_threshold=0.5)
     await _admit_then_settle(handler, _capped_team_key(2), 190)
     await handler.enforce_token_limits_for_frame(user_api_key_dict=_capped_team_key(2), requested_model="shared-model")
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_closed", [True, False])
+async def test_saturation_check_redis_outage_posture(monkeypatch, fail_closed):
+    """With fail_closed_rate_limit_enforcement the saturation check rejects on an
+    outage instead of assuming zero saturation; disabled, it keeps the upstream
+    fail-open default."""
+    from litellm.types.router import ModelGroupInfo
+
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+    monkeypatch.setattr(
+        "litellm.proxy.hooks.dynamic_rate_limiter_v3._fail_closed_rate_limit_enforcement_enabled",
+        lambda: fail_closed,
+    )
+    with patch.object(
+        handler,
+        "_get_saturation_value_from_cache",
+        new=AsyncMock(side_effect=ConnectionError("redis unreachable")),
+    ):
+        if fail_closed:
+            with pytest.raises(RateLimitUnverifiableError) as excinfo:
+                await handler._check_model_saturation(
+                    "sq-model",
+                    ModelGroupInfo(model_group="sq", providers=["openai"], rpm=100, tpm=200),
+                )
+            assert excinfo.value.status_code == 503
+        else:
+            saturation = await handler._check_model_saturation(
+                "sq-model",
+                ModelGroupInfo(model_group="sq", providers=["openai"], rpm=100, tpm=200),
+            )
+            assert saturation == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_closed", [True, False])
+async def test_pre_call_hook_redis_outage_posture(monkeypatch, fail_closed):
+    """The pre-call hook's catch-all honors the fail-closed flag instead of
+    admitting an unverifiable request."""
+    from litellm.types.router import ModelGroupInfo
+
+    handler = DynamicRateLimitHandler(internal_usage_cache=DualCache())
+    model_group_info: Final = ModelGroupInfo(model_group="sq", providers=["openai"], rpm=100, tpm=200)
+
+    class _ModelGroupRegistry:
+        def group(self, model: str) -> ModelGroupInfo:
+            return model_group_info
+
+    class _RouterRegistry:
+        def registry(self) -> _ModelGroupRegistry:
+            return _ModelGroupRegistry()
+
+    handler.update_variables(_RouterRegistry())
+    monkeypatch.setattr(
+        "litellm.proxy.hooks.dynamic_rate_limiter_v3._fail_closed_rate_limit_enforcement_enabled",
+        lambda: fail_closed,
+    )
+    with patch.object(
+        handler,
+        "_check_model_saturation",
+        new=AsyncMock(side_effect=ConnectionError("redis unreachable")),
+    ):
+        if fail_closed:
+            with pytest.raises(RateLimitUnverifiableError):
+                await handler.async_pre_call_hook(
+                    user_api_key_dict=UserAPIKeyAuth(),
+                    cache=DualCache(),
+                    data={"model": "sq-model"},
+                    call_type="completion",
+                )
+        else:
+            outcome = await handler.async_pre_call_hook(
+                user_api_key_dict=UserAPIKeyAuth(),
+                cache=DualCache(),
+                data={"model": "sq-model"},
+                call_type="completion",
+            )
+            assert outcome is None

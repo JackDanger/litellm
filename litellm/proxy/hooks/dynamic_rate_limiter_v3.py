@@ -35,10 +35,12 @@ from litellm.proxy.hooks.parallel_request_limiter_v3 import (  # noqa: F401  # l
     RateLimitedModel,
     RateLimitResponse,
     RateLimitStatus,
+    RateLimitUnverifiableError,
     _PROXY_MaxParallelRequestsHandler_v3,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     _socket_turn_tpm_windows,  # pyright: ignore[reportPrivateUsage]  # same per-turn TPM window the regular limiter checks
     borrowing_team_model_limits,
     claim_request_stash_for_data,
+    fail_closed_rate_limit_enforcement_enabled,
     get_or_create_request_stash,
 )
 from litellm.proxy.hooks.rate_limiter_utils import (
@@ -125,6 +127,12 @@ def _get_priority_settings() -> "PriorityReservationSettings":
 
         return PriorityReservationSettings()
     return settings
+
+
+def _fail_closed_rate_limit_enforcement_enabled() -> bool:
+    from litellm.proxy.proxy_server import general_settings  # circular-import guard
+
+    return fail_closed_rate_limit_enforcement_enabled(general_settings)
 
 
 def _is_latin1_encodable(value: object) -> bool:
@@ -347,6 +355,8 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
 
         except Exception as e:
             verbose_proxy_logger.error("Error checking saturation for %s: %s", model, e)
+            if _fail_closed_rate_limit_enforcement_enabled():
+                raise RateLimitUnverifiableError()
             # Fail open: assume not saturated on error
             return 0.0
 
@@ -859,6 +869,8 @@ class _PROXY_DynamicRateLimitHandlerV3(CustomLogger):
             raise
         except Exception as e:
             verbose_proxy_logger.error("Error in dynamic rate limiter: %s, allowing request", e)
+            if _fail_closed_rate_limit_enforcement_enabled():
+                raise RateLimitUnverifiableError()
             # Fail open on unexpected errors
             return None
 

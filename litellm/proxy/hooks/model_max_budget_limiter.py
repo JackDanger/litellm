@@ -36,6 +36,10 @@ from litellm.proxy.hooks.model_budget_shared_windows import (
     SharedWindow,
     SharedWindows,
 )
+from litellm.proxy.hooks.parallel_request_limiter_v3 import (
+    RateLimitUnverifiableError,
+    fail_closed_rate_limit_enforcement_enabled,
+)
 from litellm.router_strategy.budget_limiter import RouterBudgetLimiting, budget_window_seconds
 from litellm.types.llms.openai import AllMessageValues
 from litellm.types.utils import BudgetConfig, LlmProviders, StandardLoggingPayload
@@ -873,6 +877,19 @@ def _metadata_string_value(metadata: object, key: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
+MODEL_BUDGET_UNVERIFIABLE_MESSAGE: Final = (
+    "Model budget enforcement unavailable: the current model spend could not be read from Redis, and "
+    "fail_closed_rate_limit_enforcement is enabled, so the request was rejected to avoid exceeding the "
+    "configured model budget. Retry shortly."
+)
+
+
+def _fail_closed_rate_limit_enforcement_enabled() -> bool:
+    from litellm.proxy.proxy_server import general_settings  # circular-import guard
+
+    return fail_closed_rate_limit_enforcement_enabled(general_settings)
+
+
 class _PROXY_VirtualKeyModelMaxBudgetLimiter(RouterBudgetLimiting):
     """
     Handles budgets for model + virtual key
@@ -1159,7 +1176,17 @@ class _PROXY_VirtualKeyModelMaxBudgetLimiter(RouterBudgetLimiting):
         redis_cache: Final = self.dual_cache.redis_cache
         if redis_cache is None:
             return await self.dual_cache.async_get_cache(key=spend_key)
-        return await redis_cache.async_get_cache(key=spend_key)
+        fail_closed: Final = _fail_closed_rate_limit_enforcement_enabled()
+        try:
+            if fail_closed:
+                # RedisCache swallows read failures by default and returns None; under
+                # fail_closed_rate_limit_enforcement a swallowed outage must not read as zero spend.
+                return await redis_cache.async_get_cache(key=spend_key, raise_on_error=True)
+            return await redis_cache.async_get_cache(key=spend_key)
+        except Exception as e:
+            if not fail_closed:
+                raise
+            raise RateLimitUnverifiableError(MODEL_BUDGET_UNVERIFIABLE_MESSAGE) from e
 
     @with_service_target("model_budgets")
     async def async_filter_deployments(

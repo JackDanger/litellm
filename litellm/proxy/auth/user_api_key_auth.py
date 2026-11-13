@@ -4142,7 +4142,12 @@ async def run_centralized_common_checks(
                         )
                     ),
                 )
-            if sub_call and RouteChecks.is_llm_api_route(route=route):
+            # The auth-cache hit path reaches here with sub_call=False and the
+            # builder never ran (the cache hit skipped the pipeline), so the
+            # "the builder checked the key's own max_budget" assumption is
+            # false on cache hits. The check is a read and a compare; idempotent,
+            # so it runs on every llm-route request.
+            if RouteChecks.is_llm_api_route(route=route):
                 await virtual_key_max_budget_check(
                     valid_token=user_api_key_auth_obj,
                     proxy_logging_obj=proxy_logging_obj,

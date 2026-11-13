@@ -13317,6 +13317,9 @@ async def test_admission_and_budget_reservation_read_the_key_spend_counter_with_
         **_proxy_attrs_for_centralized_checks(user_custom_auth=None),
         "prisma_client": MagicMock(),
         "spend_counter_store": store,
+        # the key budget check now runs on every llm-route request (the auth-cache
+        # hit path included) and schedules budget_alerts; the double must absorb it
+        "proxy_logging_obj": AsyncMock(),
     }
     originals = {a: getattr(_proxy_server_mod, a, None) for a in attrs}
     try:
@@ -14197,3 +14200,55 @@ async def test_should_skip_budget_checks_spares_only_zero_spend_mcp_discovery(
         )
         is expected
     )
+
+
+async def _run_centralized_checks_for_cache_hit(
+    monkeypatch: pytest.MonkeyPatch,
+    attrs: Mapping[str, object],
+) -> AsyncMock:
+    """Run the centralized gate the way the auth-cache hit path does (the
+    default sub_call=False call site) and return the mock that stands in for the
+    key's own max_budget check."""
+    import litellm.proxy.proxy_server as _proxy_server_mod
+    from fastapi import Request
+    from starlette.datastructures import URL
+
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.utils import ProxyLogging
+
+    check: Final = AsyncMock()
+    monkeypatch.setattr(
+        "litellm.proxy.auth.user_api_key_auth.virtual_key_max_budget_check",
+        check,
+    )
+    key_cache: Final = UserApiKeyCache()
+    request_attrs: Final = {
+        **attrs,
+        "user_api_key_cache": key_cache,
+        "spend_counter_cache": DualCache(),
+        "proxy_logging_obj": ProxyLogging(user_api_key_cache=key_cache),
+    }
+    for name, value in request_attrs.items():
+        monkeypatch.setattr(_proxy_server_mod, name, value, raising=False)
+    request: Final = Request(scope={"type": "http"})
+    request._url = URL(url="/chat/completions")
+    await run_centralized_common_checks(
+        user_api_key_auth_obj=UserAPIKeyAuth(api_key="sk-test", user_id="u1"),
+        request=request,
+        request_data={"model": "gpt-4o"},
+        route="/chat/completions",
+    )
+    return check
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_path_runs_the_key_budget_check(monkeypatch):
+    """The auth-cache hit path reaches the centralized gate with sub_call=False
+    and the builder never ran (the cache hit skipped the pipeline), so the key's
+    own max_budget check must not be gated on sub_call."""
+    check: Final = await _run_centralized_checks_for_cache_hit(
+        monkeypatch,
+        _proxy_attrs_for_centralized_checks(),
+    )
+    assert check.await_count == 1
+

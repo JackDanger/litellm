@@ -456,7 +456,47 @@ class RouterBudgetLimiting(CustomLogger):
         - stores key: `provider_spend:{provider}:1d`, value: response_cost
         - stores key: `provider_budget_start_time:{provider}`, value: current_time.
             This stores the start time of the new budget window
+
+        The spend reset is claimed with SET NX EX so concurrent workers cannot overwrite each
+        other's response_cost: the winner seeds the window with its own cost, losers fall
+        through to a plain in-window increment so their cost is still counted.
         """
+        redis_cache: Final = self.dual_cache.redis_cache
+        if redis_cache is not None:
+            try:
+                claim_won: Final = (
+                    await redis_cache.async_set_cache(key=spend_key, value=response_cost, ttl=ttl_seconds, nx=True)
+                    is True
+                )
+            except Exception as e:
+                log_redis_failure(
+                    verbose_router_logger,
+                    logging.WARNING,
+                    "budget window reset claim failed; keeping legacy reset",
+                    e,
+                )
+                claim_won = True
+            if not claim_won:
+                budget_start = await self.dual_cache.async_get_cache(start_time_key)
+                remaining: Final = (
+                    ttl_seconds
+                    if budget_start is None
+                    else int(max(1, ttl_seconds - (current_time - float(budget_start))))
+                )
+                await self._increment_spend_in_current_window(
+                    spend_key=spend_key,
+                    response_cost=response_cost,
+                    ttl=remaining,
+                )
+                return current_time if budget_start is None else float(budget_start)
+            if self.dual_cache.in_memory_cache is not None:
+                # mirror the claimed seed so the local view does not carry the expired window
+                await self.dual_cache.in_memory_cache.async_set_cache(
+                    key=spend_key, value=response_cost, ttl=ttl_seconds
+                )
+            await self.dual_cache.async_set_cache(key=start_time_key, value=current_time, ttl=ttl_seconds)
+            return current_time
+
         await self.dual_cache.async_set_cache(key=spend_key, value=response_cost, ttl=ttl_seconds)
         await self.dual_cache.async_set_cache(key=start_time_key, value=current_time, ttl=ttl_seconds)
         return current_time
