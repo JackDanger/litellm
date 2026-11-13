@@ -4430,3 +4430,33 @@ def test_is_client_error_exception_existing_behaviour_unchanged() -> None:
     assert _is_client_error_exception(HTTPException(status_code=500, detail="x")) is False
     assert _is_client_error_exception(ProxyException(message="x", type="x", param=None, code="429")) is True
     assert _is_client_error_exception(ValueError("x")) is False
+
+
+@pytest.mark.asyncio
+async def test_llm_exception_alert_escapes_the_provider_echoed_exception_text() -> None:
+    """The exception text an LLM call failed with can echo provider response
+    content, so its angle brackets and backticks must not reach the on-call
+    Slack alert unescaped: closing its own backtick quoting is enough to inject
+    mention or link markup."""
+    import litellm
+    from litellm.types.integrations.slack_alerting import AlertType
+
+    proxy_logging_obj: Final = ProxyLogging(user_api_key_cache=DualCache())
+    proxy_logging_obj.alert_types = [AlertType.llm_exceptions]
+    alerting_handler: Final = AsyncMock()
+
+    with (
+        patch.object(proxy_logging_obj, "update_request_status", new=AsyncMock()),
+        patch.object(proxy_logging_obj, "alerting_handler", new=alerting_handler),
+        patch.object(litellm, "callbacks", []),
+    ):
+        await proxy_logging_obj.post_call_failure_hook(
+            request_data={},
+            original_exception=Exception("boom <@U123> <!here> `x`"),
+            user_api_key_dict=UserAPIKeyAuth(),
+        )
+        await asyncio.sleep(0)
+
+    message: Final = alerting_handler.call_args.kwargs["message"]
+    assert "<@U123>" not in message and "&lt;@U123&gt;" in message
+    assert "`x`" not in message

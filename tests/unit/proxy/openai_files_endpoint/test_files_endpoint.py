@@ -5329,6 +5329,31 @@ def test_create_file_non_batch_under_max_file_size_mb_forwards(monkeypatch, llm_
     assert len(forwarded_calls) == 1
 
 
+def test_create_file_without_a_configured_cap_still_bounds_the_upload_read(monkeypatch, llm_router: Router):
+    """With no max_file_size_mb configured the read used to be unbounded, so any
+    key could stream an arbitrarily large multipart body into RAM. The read is
+    capped at a 200 MB default ceiling, which the forwarded payload shows."""
+    import litellm.proxy.proxy_server as ps
+    from litellm.proxy.openai_files_endpoints.general_upload_validation import MB
+
+    forwarded_calls = _setup_batch_upload_endpoint(monkeypatch, llm_router)
+    monkeypatch.delitem(ps.general_settings, "max_file_size_mb", raising=False)
+
+    try:
+        response = client.post(
+            "/v1/files",
+            files={"file": ("payload.bin", b"x" * (201 * 1024 * 1024), "application/octet-stream")},
+            data={"purpose": "user_data"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+        assert response.status_code == 200, response.text
+        assert len(forwarded_calls) == 1
+        file_source = forwarded_calls[0]["_create_file_request"]["file"][1]
+        assert len(file_source) == 200 * MB + 1
+    finally:
+        _teardown_batch_upload_endpoint()
+
+
 def test_create_file_blocked_extension_rejected_before_forwarding(monkeypatch, llm_router: Router):
     import litellm.proxy.proxy_server as ps
 

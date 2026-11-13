@@ -3,7 +3,7 @@ Based on Google's GenAI Kit dotprompt implementation: https://google.github.io/d
 """
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence, Sized
 from pathlib import Path
 from typing import Any, Final, Protocol
 
@@ -70,6 +70,43 @@ class PromptTemplate:
         return f"PromptTemplate(id='{self.template_id}', model='{self.model}')"
 
 
+_MAX_RENDER_RANGE: Final = 100_000
+_MAX_RENDER_ITEMS: Final = 100_000
+
+
+def _bounded_range(stop: int, start: int | None = None, step: int | None = None) -> Sequence[int]:
+    import numbers
+
+    if isinstance(stop, numbers.Number) and abs(int(stop)) > _MAX_RENDER_RANGE:
+        raise ValueError(f"range bound {stop} exceeds the render cap of {_MAX_RENDER_RANGE}")
+    if start is None:
+        return range(stop)
+    if step is None:
+        return range(start, stop)
+    return range(start, stop, step)
+
+
+def _bounded_constructor(name: str, ctor: Callable[..., Sized]) -> Callable[..., object]:
+    def _bounded_factory(*args: object, **kwargs: object) -> object:  # kwargs-ok: caller-supplied template kwargs
+        result: Final = ctor(*args, **kwargs)
+        if len(result) > _MAX_RENDER_ITEMS:
+            raise ValueError(f"{name}(...) materialization exceeds the render item cap ({_MAX_RENDER_ITEMS})")
+        return result
+
+    _bounded_factory.__name__ = name
+    return _bounded_factory
+
+
+def _bounded_template_globals() -> Mapping[str, Any]:
+    return {
+        "range": _bounded_range,
+        "list": _bounded_constructor("list", list),
+        "dict": _bounded_constructor("dict", dict),
+        "tuple": _bounded_constructor("tuple", tuple),
+        "set": _bounded_constructor("set", set),
+    }
+
+
 class PromptManager:
     """
     Manager for loading and rendering .prompt files following the Dotprompt specification.
@@ -105,6 +142,10 @@ class PromptManager:
             comment_start_string="{#",
             comment_end_string="#}",
         )
+        # Templates reach here through /prompts/test with caller-controlled text:
+        # capped range and constructor globals keep a hostile template from pinning
+        # the event loop (range(2**60)) or eagerly materializing huge lists.
+        self.jinja_env.globals.update(_bounded_template_globals())
 
         # Load prompts from directory if provided
         if self.prompt_directory:

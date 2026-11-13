@@ -1265,3 +1265,43 @@ async def test_soft_budget_alerts_webhook(entity_info):
         assert logged_webhook_event.user_email == entity_info.user_email
         assert logged_webhook_event.key_alias == entity_info.key_alias
         assert logged_webhook_event.event_group == entity_info.event_group
+
+
+def test_slack_mrkdwn_escaping_neutralizes_mentions_links_and_backticks():
+    from litellm.integrations.SlackAlerting.slack_alerting import escape_slack_mrkdwn
+
+    escaped: Final = escape_slack_mrkdwn("<@U123> <!here> <https://evil.example|click> `code`")
+
+    assert "<@U123>" not in escaped
+    assert "&lt;@U123&gt;" in escaped
+    assert "<!here>" not in escaped and "&lt;!here&gt;" in escaped
+    assert "<https://evil.example|click>" not in escaped
+    assert "`" not in escaped
+
+
+def test_slack_mrkdwn_escaping_runs_ampersand_first_without_double_escaping():
+    from litellm.integrations.SlackAlerting.slack_alerting import escape_slack_mrkdwn
+
+    assert escape_slack_mrkdwn("a & <b>") == "a &amp; &lt;b&gt;"
+
+
+@pytest.mark.asyncio
+async def test_send_alert_escapes_caller_supplied_alerting_metadata(monkeypatch):
+    """alerting_metadata is a client-controlled dict rendered into on-call alert
+    bodies: any key holder could previously inject @-mentions, <!here> blasts or
+    phishing links into the on-call channel through it."""
+    monkeypatch.delenv("ALERTING_WEBHOOK_URL", raising=False)
+    monkeypatch.setenv("SLACK_WEBHOOK_URL", "https://hooks.slack.com/services/T0/B0/X0")
+    slack_alerting: Final = _slack_alerting_with_env_resolution()
+
+    await slack_alerting.send_alert(
+        message="LLM API call failed",
+        level="High",
+        alert_type=AlertType.llm_exceptions,
+        alerting_metadata={"0xevil": "<@U999> <!here> `x`"},
+    )
+
+    queued_text: Final = slack_alerting.log_queue[0]["payload"]["text"]
+    assert "<@U999>" not in queued_text and "&lt;@U999&gt;" in queued_text
+    assert "<!here>" not in queued_text and "&lt;!here&gt;" in queued_text
+    assert "`x`" not in queued_text and "\u02cbx\u02cb" in queued_text

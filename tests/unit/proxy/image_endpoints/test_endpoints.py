@@ -741,3 +741,41 @@ def test_failed_image_generation_spend_row_records_aimage_generation(monkeypatch
         end_time=db_call["end_time"],
     )
     assert (payload["status"], payload["call_type"]) == ("failure", "aimage_generation")
+
+
+def test_image_edit_refuses_an_upload_over_the_configured_general_settings_cap(monkeypatch):
+    """`/v1/images/edits` used to buffer every upload with a bare read() and never
+    looked at general_settings.max_file_size_mb, the only cap /v1/files honors."""
+    captured = {}
+
+    client: Final = _image_edit_client(monkeypatch, captured)
+    monkeypatch.setattr("litellm.proxy.proxy_server.general_settings", {"max_file_size_mb": 1})
+
+    response = client.post(
+        "/v1/images/edits",
+        files={"image": ("tree.png", b"x" * (2 * 1024 * 1024), "image/png")},
+        data={"model": "gpt-image-1", "prompt": "add a hat"},
+    )
+
+    assert response.status_code == 413, response.text
+    assert "max_file_size_mb" in response.text
+    assert captured == {}
+
+
+def test_image_edit_refuses_an_upload_over_the_default_ceiling_when_the_cap_is_unset(monkeypatch):
+    """Without a configured cap the request-size middleware is not guaranteed to
+    be wired, so a 200 MB ceiling still applies per uploaded file."""
+    payload: Final = b"x" * (201 * 1024 * 1024)
+    captured = {}
+
+    try:
+        response = _image_edit_client(monkeypatch, captured).post(
+            "/v1/images/edits",
+            files={"image": ("tree.png", payload, "image/png")},
+            data={"model": "gpt-image-1", "prompt": "add a hat"},
+        )
+    finally:
+        del payload
+
+    assert response.status_code == 413, response.text
+    assert captured == {}

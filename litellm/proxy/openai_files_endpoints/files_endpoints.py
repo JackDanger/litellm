@@ -628,7 +628,10 @@ async def create_file(
         elif max_file_size_mb is not None and max_file_size_mb > 0:
             file_source = await file.read(max_file_size_mb * MB + 1)
         else:
-            file_source = await file.read()
+            # An unflushed read() with no configured cap buffers unbounded
+            # multipart bytes in RAM from any key, so a 200 MB floor still
+            # bounds the call when max_file_size_mb is unset.
+            file_source = await file.read(200 * MB + 1)  # rebind-ok: joins the annotated file_source declaration above
         custom_llm_provider = (
             provider
             or get_custom_llm_provider_from_request_headers(request=request)

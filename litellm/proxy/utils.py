@@ -162,7 +162,7 @@ from litellm.integrations.custom_guardrail import (
 )
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.prometheus import PrometheusLogger
-from litellm.integrations.SlackAlerting.slack_alerting import SlackAlerting
+from litellm.integrations.SlackAlerting.slack_alerting import SlackAlerting, escape_slack_mrkdwn
 from litellm.integrations.SlackAlerting.utils import add_langfuse_trace_id_to_alert
 from litellm.litellm_core_utils.api_route_to_call_types import get_call_types_for_route
 from litellm.litellm_core_utils.core_helpers import (
@@ -4128,7 +4128,10 @@ class ProxyLogging:
 
             asyncio.create_task(
                 self.alerting_handler(
-                    message=redact_string(f"LLM API call failed: `{exception_str}`"),
+                    # exception_str can echo provider response text: without
+                    # escaping, its own backticks/angle brackets inject mrkdwn
+                    # mentions or links into the on-call channel.
+                    message=redact_string(f"LLM API call failed: `{escape_slack_mrkdwn(exception_str)}`"),
                     level="High",
                     alert_type=AlertType.llm_exceptions,
                     request_data=request_data,

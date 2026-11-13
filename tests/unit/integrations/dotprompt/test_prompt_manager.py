@@ -784,3 +784,28 @@ def test_sync_caller_ignore_flag_survives_missing_prompt_spec():
         ignore_prompt_manager_model=True,
     )
     assert model == "anthropic/claude-haiku-4-5"
+
+
+def test_render_range_still_accepts_small_iterations():
+    manager: Final = PromptManager()
+    assert manager.jinja_env.from_string("{{ range(5) | list }}").render() == "[0, 1, 2, 3, 4]"
+
+
+def test_render_rejects_a_range_that_would_pin_the_event_loop():
+    """Templates arrive from /prompts/test with caller-controlled text: a
+    range(99999999999) loop used to pin the sync worker for hours."""
+    manager: Final = PromptManager()
+
+    with pytest.raises(ValueError) as exc:
+        manager.jinja_env.from_string("{% for x in range(99999999999) %}{% endfor %}").render()
+
+    assert "render cap" in str(exc.value)
+
+
+def test_render_rejects_an_eager_materialization_over_the_item_cap():
+    manager: Final = PromptManager()
+
+    with pytest.raises(ValueError) as exc:
+        manager.jinja_env.from_string("{{ range(2**61) | list }}").render()
+
+    assert "render cap" in str(exc.value)

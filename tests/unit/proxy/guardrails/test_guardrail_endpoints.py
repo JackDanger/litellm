@@ -4204,3 +4204,28 @@ async def test_guardrail_success_delivers_sync_callback_once_with_overlapping_wo
     assert returned is response
     callback.assert_called_once()
     assert callback.call_args.args[0] == {"response": {"response_text": "masked"}}
+
+
+@pytest.mark.asyncio
+async def test_blocked_words_file_rejects_content_over_the_size_cap():
+    """The yaml validator parsed unbounded file_content, so a caller could hand it
+    arbitrarily large or alias-expanding files. Oversized content is rejected
+    before the load instead."""
+    from litellm.proxy.guardrails.guardrail_endpoints import validate_blocked_words_file
+
+    response = await validate_blocked_words_file(
+        {"file_content": "blocked_words:\n" + "  - keyword: a\n    action: BLOCK\n" * 40_000}
+    )
+
+    assert response == {"valid": False, "error": "File content exceeds 512 KB"}
+
+
+@pytest.mark.asyncio
+async def test_blocked_words_file_still_validates_content_under_the_size_cap():
+    from litellm.proxy.guardrails.guardrail_endpoints import validate_blocked_words_file
+
+    response = await validate_blocked_words_file(
+        {"file_content": "blocked_words:\n  - keyword: a\n    action: BLOCK\n"}
+    )
+
+    assert response["valid"] is True

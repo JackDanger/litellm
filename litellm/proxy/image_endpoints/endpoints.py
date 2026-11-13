@@ -48,14 +48,33 @@ IMAGE_EDIT_OPTIONAL_FIELD_DEFAULTS: Final = MappingProxyType({"prompt": None, "i
 IMAGE_ARRAY_FIELD: Final = "image[]"
 MASK_ARRAY_FIELD: Final = "mask[]"
 BRACKETED_FILE_FIELDS: Final = frozenset({IMAGE_ARRAY_FIELD, MASK_ARRAY_FIELD})
+MB_IN_BYTES: Final = 1024 * 1024
 
 
-async def uploadfile_to_bytesio(upload: UploadFile) -> io.BytesIO:
+async def _capped_upload_bytes(upload: UploadFile, max_file_size_mb: int | None) -> bytes:
+    if max_file_size_mb is None or max_file_size_mb <= 0:
+        return await upload.read()
+    head: Final = await upload.read(max_file_size_mb * MB_IN_BYTES + 1)
+    if len(head) > max_file_size_mb * MB_IN_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={"error": f"File too large: exceeds max_file_size_mb={max_file_size_mb}."},
+            headers={"content-length": str(max_file_size_mb * MB_IN_BYTES)},
+        )
+    return head
+
+
+async def uploadfile_to_bytesio(
+    upload: UploadFile,
+    max_file_size_mb: int | None = None,
+) -> io.BytesIO:
     """
     Read a FastAPI UploadFile into a BytesIO and set .name so OpenAI SDK
-    infers filename/content-type correctly.
+    infers filename/content-type correctly, enforcing max_file_size_mb when
+    configured. Without the cap every /v1/images/edits upload was buffered in
+    RAM unbounded, regardless of the general_settings cap protecting /v1/files.
     """
-    data: Final = await upload.read()
+    data: Final = await _capped_upload_bytes(upload, max_file_size_mb)
     buffer: Final = io.BytesIO(data)
     buffer.name = upload.filename
     return buffer
@@ -63,13 +82,14 @@ async def uploadfile_to_bytesio(upload: UploadFile) -> io.BytesIO:
 
 async def batch_to_bytesio(
     uploads: Sequence[UploadFile] | None,
+    max_file_size_mb: int | None = None,
 ) -> list[io.BytesIO] | None:
     """
     Convert a sequence of UploadFiles to a list of BytesIO buffers, or None.
     """
     if not uploads:
         return None
-    return [await uploadfile_to_bytesio(u) for u in uploads]
+    return [await uploadfile_to_bytesio(u, max_file_size_mb=max_file_size_mb) for u in uploads]
 
 
 @router.post(
@@ -328,8 +348,22 @@ async def image_edit_api(
         for key, value in chain(IMAGE_EDIT_OPTIONAL_FIELD_DEFAULTS.items(), form_fields.items())
         if key not in BRACKETED_FILE_FIELDS
     }
-    image_files: Final = await batch_to_bytesio(image)
-    mask_files: Final = await batch_to_bytesio(mask)
+    # The request-size middleware is enterprise-gated, so a deployment without
+    # max_file_size_mb still gets a 200 MB ceiling per uploaded file.
+    from litellm.proxy.openai_files_endpoints.general_upload_validation import (
+        coerce_optional_int_setting,
+    )
+    from litellm.proxy.proxy_server import general_settings_view
+
+    max_file_size_mb_setting: Final[object | None] = general_settings_view().get("max_file_size_mb")
+    max_file_size_mb_configured: Final[int | None] = coerce_optional_int_setting(max_file_size_mb_setting)
+    max_file_size_mb: Final = (
+        max_file_size_mb_configured
+        if max_file_size_mb_configured is not None and max_file_size_mb_configured > 0
+        else 200
+    )
+    image_files: Final = await batch_to_bytesio(image, max_file_size_mb=max_file_size_mb)
+    mask_files: Final = await batch_to_bytesio(mask, max_file_size_mb=max_file_size_mb)
     if image_files:
         data["image"] = image_files
     if mask_files:
