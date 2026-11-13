@@ -24665,7 +24665,7 @@ async def test_generate_key_budget_id_allowed_for_admin(monkeypatch):
             litellm_changed_by=None,
             team_table=None,
         )
-    assert mock_generate_key.awaited
+    assert mock_generate_key.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -24739,7 +24739,7 @@ async def test_generate_key_metadata_budget_authority_allowed_for_admin():
             litellm_changed_by=None,
             team_table=None,
         )
-    assert mock_generate_key.awaited
+    assert mock_generate_key.await_count == 1
 
 
 def _member_key_row() -> LiteLLM_VerificationToken:
@@ -24869,7 +24869,7 @@ async def test_regenerate_budget_change_requires_admin(monkeypatch):
             user_api_key_cache=MagicMock(),
             proxy_logging_obj=MagicMock(),
         )
-    assert admin_check.awaited
+    assert admin_check.await_count == 1
     assert "/key/regenerate" in admin_check.call_args.kwargs["route"]
 
 
