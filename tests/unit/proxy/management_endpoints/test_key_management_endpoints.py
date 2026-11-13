@@ -24618,3 +24618,360 @@ def test_user_new_without_a_key_does_not_check_guardrail_names(spend_permission_
 
     assert response.status_code == 200, response.text
     find_many.assert_not_awaited()
+
+
+# --- Tests: budget authority gates on key generate, update and regenerate ---
+
+
+@pytest.mark.asyncio
+async def test_generate_key_budget_id_rejected_for_non_admin():
+    """A foreign budget_id supplies the key's effective limits straight from
+    LiteLLM_BudgetTable, so a non-admin attaching one on generate escalates
+    their ceiling past the delegation checks. Only proxy admins may set it."""
+    with patch("litellm.proxy.proxy_server.prisma_client", AsyncMock()):
+        with pytest.raises(HTTPException) as exc:
+            await _common_key_generation_helper(
+                data=GenerateKeyRequest(budget_id="shared-org-budget"),
+                user_api_key_dict=UserAPIKeyAuth(
+                    user_role=LitellmUserRoles.INTERNAL_USER,
+                    api_key="sk-alice",
+                    user_id="alice",
+                ),
+                litellm_changed_by=None,
+                team_table=None,
+            )
+    assert int(getattr(exc.value, "status_code", 0)) == 403
+    assert "Only proxy admins can set budget_id" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_generate_key_budget_id_allowed_for_admin(monkeypatch):
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", AsyncMock()),
+        patch("litellm.proxy.proxy_server.llm_router", None),
+        patch(
+            "litellm.proxy.management_endpoints.key_management_endpoints.generate_key_helper_fn",
+            new_callable=AsyncMock,
+        ) as mock_generate_key,
+    ):
+        mock_generate_key.return_value = {"key": "sk-test-key", "expires": None, "user_id": "admin"}
+        await _common_key_generation_helper(
+            data=GenerateKeyRequest(budget_id="shared-org-budget"),
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.PROXY_ADMIN,
+                api_key="sk-admin",
+                user_id="admin",
+            ),
+            litellm_changed_by=None,
+            team_table=None,
+        )
+    assert mock_generate_key.awaited
+
+
+@pytest.mark.asyncio
+async def test_generate_key_metadata_budget_authority_rejected_for_non_admin():
+    """temp_budget_increase in metadata lifts the effective max_budget at auth
+    time; a non-admin must not grant it to a new key via metadata."""
+    with patch("litellm.proxy.proxy_server.prisma_client", AsyncMock()):
+        with pytest.raises(HTTPException) as exc:
+            await _common_key_generation_helper(
+                data=GenerateKeyRequest(
+                    metadata={
+                        "temp_budget_increase": 1000000,
+                        "temp_budget_expiry": "2099-01-01T00:00:00Z",
+                    }
+                ),
+                user_api_key_dict=UserAPIKeyAuth(
+                    user_role=LitellmUserRoles.INTERNAL_USER,
+                    api_key="sk-alice",
+                    user_id="alice",
+                ),
+                litellm_changed_by=None,
+                team_table=None,
+            )
+    assert int(getattr(exc.value, "status_code", 0)) == 403
+    assert "budget authority fields" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_generate_key_metadata_throttle_rejected_for_non_admin():
+    """metadata-borne throttle_on_budget_exceeded must hit the same admin gate
+    as the typed field."""
+    with patch("litellm.proxy.proxy_server.prisma_client", AsyncMock()):
+        with pytest.raises(HTTPException) as exc:
+            await _common_key_generation_helper(
+                data=GenerateKeyRequest(metadata={"throttle_on_budget_exceeded": True}),
+                user_api_key_dict=UserAPIKeyAuth(
+                    user_role=LitellmUserRoles.INTERNAL_USER,
+                    api_key="sk-alice",
+                    user_id="alice",
+                ),
+                litellm_changed_by=None,
+                team_table=None,
+            )
+    assert int(getattr(exc.value, "status_code", 0)) == 403
+
+
+@pytest.mark.asyncio
+async def test_generate_key_metadata_budget_authority_allowed_for_admin():
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", AsyncMock()),
+        patch("litellm.proxy.proxy_server.llm_router", None),
+        patch(
+            "litellm.proxy.management_endpoints.key_management_endpoints.generate_key_helper_fn",
+            new_callable=AsyncMock,
+        ) as mock_generate_key,
+    ):
+        mock_generate_key.return_value = {"key": "sk-test-key", "expires": None, "user_id": "admin"}
+
+        await _common_key_generation_helper(
+            data=GenerateKeyRequest(
+                metadata={
+                    "temp_budget_increase": 10,
+                    "temp_budget_expiry": "2099-01-01T00:00:00Z",
+                }
+            ),
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.PROXY_ADMIN,
+                api_key="sk-1",
+                user_id="admin",
+            ),
+            litellm_changed_by=None,
+            team_table=None,
+        )
+    assert mock_generate_key.awaited
+
+
+def _member_key_row() -> LiteLLM_VerificationToken:
+    return LiteLLM_VerificationToken(
+        token="hashed_member_key",
+        user_id="member-1",
+        created_by="member-1",
+        team_id=None,
+        key_alias="member",
+        models=["m"],
+        max_budget=10.0,
+        budget_duration="30d",
+        metadata={"throttle_on_budget_exceeded": False},
+    )
+
+
+def _member_caller() -> UserAPIKeyAuth:
+    return UserAPIKeyAuth(
+        user_id="member-1",
+        user_role=LitellmUserRoles.INTERNAL_USER,
+    )
+
+
+def _owner_key_update_setup(monkeypatch):
+    """Strip the team-key dependencies _validate_update_key_data touches before
+    the budget gates, so a denial can only come from the gates themselves."""
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.get_team_object",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.TeamMemberPermissionChecks",
+        SimpleNamespace(
+            can_team_member_execute_key_management_endpoint=AsyncMock(return_value=None),
+            enforce_member_can_assign_access_groups=MagicMock(return_value=None),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_key_metadata_budget_authority_rejected_for_owner(monkeypatch):
+    _owner_key_update_setup(monkeypatch)
+    with pytest.raises(HTTPException) as exc:
+        await _validate_update_key_data(
+            data=UpdateKeyRequest(
+                key="hashed_member_key",
+                metadata={
+                    "temp_budget_increase": 1000000,
+                    "temp_budget_expiry": "2099-01-01T00:00:00Z",
+                },
+            ),
+            existing_key_row=_member_key_row(),
+            user_api_key_dict=_member_caller(),
+            llm_router=None,
+            premium_user=True,
+            prisma_client=AsyncMock(),
+            user_api_key_cache=MagicMock(),
+        )
+    assert int(getattr(exc.value, "status_code", 0)) == 403
+    assert "budget authority fields" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_update_key_non_budget_metadata_by_owner_passes_without_admin(monkeypatch):
+    """The gate must be narrow: innocuous metadata edits keep flowing for the
+    owner without the admin check; a blanket-deny mutation breaks this."""
+    _owner_key_update_setup(monkeypatch)
+    admin_check = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints._check_key_admin_access",
+        admin_check,
+    )
+    await _validate_update_key_data(
+        data=UpdateKeyRequest(
+            key="hashed_member_key",
+            metadata={"team_note": "hi"},
+        ),
+        existing_key_row=_member_key_row(),
+        user_api_key_dict=_member_caller(),
+        llm_router=None,
+        premium_user=True,
+        prisma_client=AsyncMock(),
+        user_api_key_cache=MagicMock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_regenerate_budget_change_requires_admin(monkeypatch):
+    """A key owner may regenerate their token, but the same call must not reset
+    the spend counter or lift max_budget without the admin check."""
+    admin_check = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints._check_key_admin_access",
+        admin_check,
+    )
+    with (
+        patch(
+            "litellm.proxy.management_endpoints.key_management_endpoints.get_new_token",
+            new_callable=AsyncMock,
+            return_value="sk-newtoken1234ab12",
+        ),
+        patch(
+            "litellm.proxy.management_endpoints.key_management_endpoints._insert_deprecated_key",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "litellm.proxy.management_endpoints.key_management_endpoints.delete_cache_key_object",
+            new_callable=AsyncMock,
+        ),
+        patch(
+            "litellm.proxy.management_endpoints.key_management_endpoints.KeyManagementEventHooks.async_key_rotated_hook",
+            new_callable=AsyncMock,
+        ),
+    ):
+        await _execute_virtual_key_regeneration(
+            prisma_client=_make_regenerate_mock_prisma(),
+            key_in_db=_make_regenerate_existing_key(),
+            hashed_api_key="abc123",
+            key="abc123",
+            data=RegenerateKeyRequest(spend=0.0, max_budget=100000.0),
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.INTERNAL_USER,
+                api_key="sk-alice",
+                user_id="user-1",
+            ),
+            litellm_changed_by=None,
+            user_api_key_cache=MagicMock(),
+            proxy_logging_obj=MagicMock(),
+        )
+    assert admin_check.awaited
+    assert "/key/regenerate" in admin_check.call_args.kwargs["route"]
+
+
+@pytest.mark.asyncio
+async def test_regenerate_metadata_budget_authority_rejected_for_owner(monkeypatch):
+    with pytest.raises(HTTPException) as exc:
+        await _execute_virtual_key_regeneration(
+            prisma_client=_make_regenerate_mock_prisma(),
+            key_in_db=_make_regenerate_existing_key(),
+            hashed_api_key="abc123",
+            key="abc123",
+            data=RegenerateKeyRequest(metadata={"temp_budget_increase": 10}),
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.INTERNAL_USER,
+                api_key="sk-alice",
+                user_id="user-1",
+            ),
+            litellm_changed_by=None,
+            user_api_key_cache=MagicMock(),
+            proxy_logging_obj=MagicMock(),
+        )
+    assert int(getattr(exc.value, "status_code", 0)) == 403
+
+
+@pytest.mark.asyncio
+async def test_regenerate_budget_id_attachment_rejected_for_non_admin(monkeypatch):
+    """Regenerate inherits /key/update's write path, so attaching a budget_id
+    here must carry the same proxy-admin-only rule as the other routes."""
+    with pytest.raises(HTTPException) as exc:
+        await _execute_virtual_key_regeneration(
+            prisma_client=_make_regenerate_mock_prisma(),
+            key_in_db=_make_regenerate_existing_key(),
+            hashed_api_key="abc123",
+            key="abc123",
+            data=RegenerateKeyRequest(budget_id="shared-org-budget"),
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.INTERNAL_USER,
+                api_key="sk-alice",
+                user_id="user-1",
+            ),
+            litellm_changed_by=None,
+            user_api_key_cache=MagicMock(),
+            proxy_logging_obj=MagicMock(),
+        )
+    assert int(getattr(exc.value, "status_code", 0)) == 403
+    assert "Only proxy admins can set budget_id" in str(exc.value.detail)
+
+
+def test_budget_id_change_validator_refuses_non_admin_new_budget():
+    from litellm.proxy.management_endpoints.key_management_endpoints import _validate_budget_id_change
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            _validate_budget_id_change(
+                requested_budget_id="org-budget-1",
+                existing_budget_id=None,
+                user_api_key_dict=UserAPIKeyAuth(
+                    user_role=LitellmUserRoles.INTERNAL_USER,
+                    api_key="sk-x",
+                ),
+            )
+        )
+    assert int(getattr(exc.value, "status_code", 0)) == 403
+    asyncio.run(
+        _validate_budget_id_change(
+            requested_budget_id="kept-budget",
+            existing_budget_id="kept-budget",
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.INTERNAL_USER,
+                api_key="sk-x",
+            ),
+        )
+    )
+
+
+def test_metadata_budget_authority_gate_passes_admins_and_innocuous_metadata():
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _reject_non_admin_budget_authority_metadata,
+    )
+
+    internal = UserAPIKeyAuth(user_role=LitellmUserRoles.INTERNAL_USER, api_key="sk-x")
+    admin = UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, api_key="sk-admin")
+
+    with pytest.raises(HTTPException):
+        _reject_non_admin_budget_authority_metadata(
+            data=GenerateKeyRequest(metadata={"temp_budget_increase": 999}),
+            existing_metadata=None,
+            user_api_key_dict=internal,
+        )
+    with pytest.raises(HTTPException):
+        _reject_non_admin_budget_authority_metadata(
+            data=GenerateKeyRequest(metadata={"throttle_on_budget_exceeded": True}),
+            existing_metadata={},
+            user_api_key_dict=internal,
+        )
+    _reject_non_admin_budget_authority_metadata(
+        data=GenerateKeyRequest(metadata={"team_note": "hi"}),
+        existing_metadata={},
+        user_api_key_dict=internal,
+    )
+    _reject_non_admin_budget_authority_metadata(
+        data=GenerateKeyRequest(metadata={"temp_budget_increase": 999}),
+        existing_metadata=None,
+        user_api_key_dict=admin,
+    )

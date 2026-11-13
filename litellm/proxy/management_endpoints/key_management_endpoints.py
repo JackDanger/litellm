@@ -1529,6 +1529,18 @@ async def _common_key_generation_helper(
             detail={"error": "Only proxy admins can enable throttle_on_budget_exceeded on a key."},
         )
 
+    _reject_non_admin_budget_authority_metadata(
+        data=data,
+        existing_metadata=None,
+        user_api_key_dict=user_api_key_dict,
+    )
+
+    await _validate_budget_id_change(
+        requested_budget_id=data.budget_id,
+        existing_budget_id=None,
+        user_api_key_dict=user_api_key_dict,
+    )
+
     await _validate_end_user_budget_id_change(
         requested_budget_id=_requested_end_user_budget_id(data),
         existing_budget_id=None,
@@ -3671,6 +3683,68 @@ async def _validate_end_user_budget_id_change(
         raise HTTPException(status_code=400, detail=missing_detail)
 
 
+async def _validate_budget_id_change(
+    requested_budget_id: str | None,
+    existing_budget_id: str | None,
+    user_api_key_dict: UserAPIKeyAuth,
+) -> None:
+    """A key's budget_id row supplies the key's effective limits (max_budget, tpm/rpm,
+    model_max_budget) from LiteLLM_BudgetTable, so only proxy admins may change it. The
+    delegation-ceiling check fires only when max_budget is set explicitly, so an unvalidated
+    budget_id sidesteps it entirely. Dangling ids stay a no-op, as this file treats them."""
+    if requested_budget_id is None or requested_budget_id == (existing_budget_id or ""):
+        return
+    if user_api_key_dict.user_role != LitellmUserRoles.PROXY_ADMIN.value:
+        forbidden_detail: Final = {"error": "Only proxy admins can set budget_id on a key."}
+        raise HTTPException(status_code=403, detail=forbidden_detail)
+
+
+_TEMP_BUDGET_METADATA_KEYS: Final[frozenset[str]] = frozenset({"temp_budget_increase", "temp_budget_expiry"})
+
+
+def _reject_non_admin_budget_authority_metadata(
+    *,
+    data: KeyRequestBase,
+    existing_metadata: Mapping[str, object] | None,
+    user_api_key_dict: UserAPIKeyAuth,
+) -> None:
+    """Reject metadata granting budget authority to a non-admin caller.
+
+    temp_budget_increase/temp_budget_expiry lift the effective max_budget at auth time and a
+    metadata-borne throttle_on_budget_exceeded flips a hard-blocked over-budget key into
+    throttled-continue. The equivalent typed request fields are admin-gated; without this the
+    same values ride the free-form metadata dict past those gates."""
+    incoming: Final = data.metadata if isinstance(data.metadata, Mapping) else {}
+    existing: Final = existing_metadata if isinstance(existing_metadata, Mapping) else {}
+    if user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN.value:
+        return
+    sets_temp_budget: Final = any(key in incoming for key in _TEMP_BUDGET_METADATA_KEYS)
+    incoming_throttle: Final = incoming.get("throttle_on_budget_exceeded")
+    existing_throttle: Final = existing.get("throttle_on_budget_exceeded")
+    escalates_throttle: Final = incoming_throttle is True and existing_throttle is not True
+    if not (sets_temp_budget or escalates_throttle):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "error": (
+                "Only proxy admins can set budget authority fields in key metadata "
+                "(temp_budget_increase, temp_budget_expiry, throttle_on_budget_exceeded)."
+            )
+        },
+    )
+
+
+def _key_request_moves_budget(
+    *,
+    data: UpdateKeyRequest,
+    existing_key_row: LiteLLM_VerificationToken,
+) -> bool:
+    """Whether the request moves the key's budget enforcement: the ceiling, the recorded
+    counter, the window schedule, or the budget row the limits come from."""
+    return not isinstance(classify_key_budget_change(data=data, existing=existing_key_row), KeyBudgetUnchanged)
+
+
 _GENERAL_SETTINGS: Final = TypeAdapter(dict[str, object])
 
 
@@ -3887,6 +3961,12 @@ async def _validate_update_key_data(
             status_code=403,
             detail={"error": "Only proxy admins can enable throttle_on_budget_exceeded on a key."},
         )
+
+    _reject_non_admin_budget_authority_metadata(
+        data=data,
+        existing_metadata=_existing_metadata if isinstance(_existing_metadata, dict) else None,
+        user_api_key_dict=user_api_key_dict,
+    )
 
     await _validate_end_user_budget_id_change(
         requested_budget_id=_requested_end_user_budget_id(data),
@@ -6405,6 +6485,33 @@ async def _execute_virtual_key_regeneration(
             user_api_key_dict=user_api_key_dict,
             prisma_client=prisma_client,
         )
+        _reject_non_admin_budget_authority_metadata(
+            data=data,
+            existing_metadata=_existing_key_metadata if isinstance(_existing_key_metadata, dict) else None,
+            user_api_key_dict=user_api_key_dict,
+        )
+        await _validate_budget_id_change(
+            requested_budget_id=data.budget_id,
+            existing_budget_id=key_in_db.budget_id,
+            user_api_key_dict=user_api_key_dict,
+        )
+        update_request: Final = _regenerate_request_as_update_request(key=hashed_api_key, data=data)
+        _regenerate_caller_is_proxy_admin: Final = (
+            user_api_key_dict.user_role is not None
+            and user_api_key_dict.user_role == LitellmUserRoles.PROXY_ADMIN.value
+        )
+        if (
+            not _regenerate_caller_is_proxy_admin
+            and update_request is not None
+            and _key_request_moves_budget(data=update_request, existing_key_row=key_in_db)
+        ):
+            await _check_key_admin_access(
+                user_api_key_dict=user_api_key_dict,
+                hashed_token=hashed_api_key,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                route="/key/regenerate (max_budget/spend)",
+            )
 
     new_token: Final = await get_new_token(data=data)
     new_token_hash: Final = hash_token(new_token)
@@ -6412,7 +6519,6 @@ async def _execute_virtual_key_regeneration(
 
     non_default_values = {}
     if data is not None:
-        update_request: Final = _regenerate_request_as_update_request(key=hashed_api_key, data=data)
         if update_request is not None:
             await _enforce_custom_key_update_policy(hook=_custom_key_update_hook(proxy_server), data=update_request)
         # Enforce upperbound key params on regenerate (don't fill defaults)
