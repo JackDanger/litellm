@@ -28,6 +28,7 @@ from litellm.proxy.common_utils.http_parsing_utils import read_raw_json_body
 from litellm.proxy.route_llm_request import JSON_OBJECT_ADAPTER
 from litellm.proxy.utils import jsonify_object
 from litellm.proxy.vector_store_endpoints.utils import (
+    assert_provider_native_vector_store_ids_allowed,
     assert_proxy_admin_for_vector_store_index_management,
     assert_user_can_access_vector_store,
     get_litellm_managed_vector_store,
@@ -138,6 +139,11 @@ async def _update_request_data_with_litellm_managed_vector_store_registry(
         vector_store_id=vector_store_id
     )
     if vector_store_to_run is None:
+        if user_api_key_dict is not None:
+            assert_provider_native_vector_store_ids_allowed(
+                vector_store_id=vector_store_id,
+                user_api_key_dict=user_api_key_dict,
+            )
         return data
     if user_api_key_dict is not None:
         await assert_user_can_access_vector_store(
