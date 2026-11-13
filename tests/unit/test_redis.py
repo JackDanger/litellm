@@ -3378,3 +3378,24 @@ def test_redis_py_kwargs_catalog_names_the_environment_kwargs_python_reads():
     catalogued: Final = frozenset(name for name, arg in _REDIS_PY_KWARGS["args"].items() if arg["environment"])
 
     assert catalogued == frozenset(_get_redis_env_kwarg_mapping().values())
+
+
+def test_get_redis_connection_pool_reports_redis_config_through_the_masking_helper(monkeypatch):
+    """The connection pool constructor's config dump must go through the masking
+    helper: logging the raw kwargs carried the Redis password in plaintext at
+    DEBUG. The pass-through (unmasked) dump is the regression."""
+    import litellm._redis as redis_module
+
+    captured: dict = {}
+
+    def fake_masked_print(redis_kwargs: dict) -> None:
+        captured.update(redis_kwargs)
+
+    monkeypatch.setattr(redis_module, "_pretty_print_redis_config", fake_masked_print)
+    monkeypatch.setattr(
+        redis_module, "_get_redis_client_logic", lambda **kwargs: {"password": "secret", "host": "redis-host"}
+    )
+
+    get_redis_connection_pool()
+
+    assert captured.get("host") == "redis-host", "the config dump must pass through _pretty_print_redis_config"

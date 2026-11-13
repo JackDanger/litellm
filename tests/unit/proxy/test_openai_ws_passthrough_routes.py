@@ -620,3 +620,37 @@ async def test_proxy_frame_model_gate_refuses_out_loud_when_auth_cannot_answer()
     )
 
     assert refusal == WebsocketFrameModelRefused(message=_OPENAI_WS_UNAVAILABLE_AUTH_REFUSAL, error_type="server_error")
+
+
+@pytest.mark.asyncio
+async def test_openai_websocket_does_not_echo_a_bearer_bearing_subprotocol():
+    """The OpenAI realtime browser client advertises its bearer as a subprotocol
+    (openai-insecure-api-key.<key>). Echoing it back put a live credential in the
+    101 handshake response headers, so the accept must stay silent instead."""
+    websocket: Final = _FakeWebSocket(
+        "/openai/v1/realtime",
+        "model=gpt-realtime-2.1",
+        subprotocols="openai-insecure-api-key.sk-live-token",
+    )
+
+    with patch(GET_CREDENTIALS, return_value="sk-provider"):
+        served: Final = await _serve(websocket, "v1/realtime", UserAPIKeyAuth(), ENABLED)
+
+    assert websocket.accepts == [None]
+    assert [call.accept_websocket for call in served.relay.calls] == [False]
+
+
+def test_negotiated_subprotocol_picks_the_first_subprotocol_that_is_not_a_bearer():
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _negotiated_websocket_subprotocol,
+    )
+
+    class _Requested:
+        def __init__(self, value: str) -> None:
+            self.headers = {"sec-websocket-protocol": value}
+
+    assert _negotiated_websocket_subprotocol(_Requested("openai-insecure-api-key.sk-abc, realtime")) == "realtime"
+    assert _negotiated_websocket_subprotocol(_Requested("realtime, openai-insecure-api-key.sk-abc")) == "realtime"
+    assert _negotiated_websocket_subprotocol(_Requested("openai-insecure-api-key.sk-abc")) is None
+    assert _negotiated_websocket_subprotocol(_Requested("realtime")) == "realtime"
+    assert _negotiated_websocket_subprotocol(_Requested("")) is None

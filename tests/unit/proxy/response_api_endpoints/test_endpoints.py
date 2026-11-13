@@ -6326,3 +6326,68 @@ def test_input_token_count_keeps_the_joined_name_of_a_self_named_namespace_membe
 
     assert called_names(namespace_tools) == ["search__search"]
     assert called_names([{"type": "function", "name": "search", "defer_loading": True}]) == ["search"]
+
+
+@pytest.mark.asyncio
+async def test_responses_websocket_accepts_without_echoing_a_bearer_bearing_subprotocol():
+    """An OpenAI-style responses websocket client advertises its bearer as a
+    subprotocol (openai-insecure-api-key.<key>, a live credential), so echoing
+    requested_protocols[0] back would leak it through the 101 response headers."""
+    from litellm.proxy.response_api_endpoints.endpoints import responses_websocket_endpoint
+
+    ws = MagicMock()
+    ws.headers = {"sec-websocket-protocol": "openai-insecure-api-key.sk-live-token"}
+    ws.query_params = {}
+    ws.scope = {"headers": []}
+    ws.url = "ws://testserver/v1/responses"
+    ws.accept = AsyncMock()
+    ws.receive_text = AsyncMock(
+        return_value=json.dumps({"type": "response.create", "model": "gpt-4o-mini", "input": []})
+    )
+    ws.close = AsyncMock()
+
+    processor = MagicMock()
+    processor.common_processing_pre_call_logic = AsyncMock(return_value=({"model": "gpt-4o-mini"}, MagicMock()))
+
+    async def fake_llm_call():
+        return None
+
+    with (
+        patch("litellm.proxy.response_api_endpoints.endpoints._enforce_responses_ws_first_frame_model_auth", new_callable=AsyncMock),
+        patch("litellm.proxy.response_api_endpoints.endpoints.ProxyBaseLLMRequestProcessing", return_value=processor),
+        patch("litellm.proxy.route_llm_request.route_request", new_callable=AsyncMock, return_value=fake_llm_call()),
+    ):
+        await responses_websocket_endpoint(websocket=ws, model="gpt-4o-mini", user_api_key_dict=MagicMock())
+
+    assert "subprotocol" not in ws.accept.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_responses_websocket_still_negotiates_a_benign_subprotocol():
+    from litellm.proxy.response_api_endpoints.endpoints import responses_websocket_endpoint
+
+    ws = MagicMock()
+    ws.headers = {"sec-websocket-protocol": "realtime"}
+    ws.query_params = {}
+    ws.scope = {"headers": []}
+    ws.url = "ws://testserver/v1/responses"
+    ws.accept = AsyncMock()
+    ws.receive_text = AsyncMock(
+        return_value=json.dumps({"type": "response.create", "model": "gpt-4o-mini", "input": []})
+    )
+    ws.close = AsyncMock()
+
+    processor = MagicMock()
+    processor.common_processing_pre_call_logic = AsyncMock(return_value=({"model": "gpt-4o-mini"}, MagicMock()))
+
+    async def fake_llm_call():
+        return None
+
+    with (
+        patch("litellm.proxy.response_api_endpoints.endpoints._enforce_responses_ws_first_frame_model_auth", new_callable=AsyncMock),
+        patch("litellm.proxy.response_api_endpoints.endpoints.ProxyBaseLLMRequestProcessing", return_value=processor),
+        patch("litellm.proxy.route_llm_request.route_request", new_callable=AsyncMock, return_value=fake_llm_call()),
+    ):
+        await responses_websocket_endpoint(websocket=ws, model="gpt-4o-mini", user_api_key_dict=MagicMock())
+
+    assert ws.accept.await_args.kwargs == {"subprotocol": "realtime"}

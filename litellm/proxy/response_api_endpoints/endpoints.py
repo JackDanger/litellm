@@ -2792,13 +2792,12 @@ async def responses_websocket_endpoint(
     """
     # Accept the WebSocket handshake. Key was already validated by the Depends
     # above; we can safely accept regardless of whether ?model= was supplied.
-    requested_protocols: Final = [
-        p.strip() for p in (websocket.headers.get("sec-websocket-protocol") or "").split(",") if p.strip()
-    ]
-    accept_kwargs: Final[dict] = {}
-    if requested_protocols:
-        accept_kwargs["subprotocol"] = requested_protocols[0]
-    await websocket.accept(**accept_kwargs)
+    # Echo only credential-free subprotocols: an OpenAI-style client carries its
+    # bearer in a subprotocol (openai-insecure-api-key.<key>), so echoing index 0
+    # verbatim reflects a live credential into the 101 handshake response headers.
+    from litellm.proxy.proxy_server import realtime_accept_kwargs
+
+    await websocket.accept(**realtime_accept_kwargs(websocket))
 
     limit_seconds: Final = _resolve_responses_ws_session_limit_seconds()
     session_task: Final = asyncio.ensure_future(

@@ -16396,3 +16396,35 @@ async def test_accounting_window_keys_remember_a_key_without_windows_but_retry_a
         assert await proxy_server_module.accounting_window_keys("unreadable", None) == ()
         assert await proxy_server_module.accounting_window_keys("unreadable", None) == ()
         assert client.db.litellm_verificationtoken.find_unique.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_realtime_handshake_does_not_echo_a_bearer_bearing_subprotocol():
+    """The OpenAI realtime browser client carries its bearer in a subprotocol
+    (openai-insecure-api-key.<key>), so accepting verbatim reflects a live
+    credential into the 101 handshake response headers. The accept must stay
+    silent for that token."""
+    ws: Final = _lit6973_fake_realtime_ws()
+    ws.headers = {"sec-websocket-protocol": "openai-insecure-api-key.sk-live-token"}
+
+    await _lit6973_drive_realtime_session(
+        {"reserved_cost": 0.0, "input_cost": 0.0, "finalized": True, "entries": []},
+        backend_logged_success=True,
+        websocket=ws,
+    )
+
+    assert "subprotocol" not in ws.accept.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_realtime_handshake_still_negotiates_a_benign_subprotocol():
+    ws: Final = _lit6973_fake_realtime_ws()
+    ws.headers = {"sec-websocket-protocol": "realtime"}
+
+    await _lit6973_drive_realtime_session(
+        {"reserved_cost": 0.0, "input_cost": 0.0, "finalized": True, "entries": []},
+        backend_logged_success=True,
+        websocket=ws,
+    )
+
+    assert ws.accept.await_args.kwargs == {"subprotocol": "realtime"}

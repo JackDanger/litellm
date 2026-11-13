@@ -24618,3 +24618,44 @@ def test_user_new_without_a_key_does_not_check_guardrail_names(spend_permission_
 
     assert response.status_code == 200, response.text
     find_many.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ownerless_key_is_not_readable_by_an_ownerless_principal():
+    """A key with no user_id must not match a caller whose user_id is also None
+    in the /key/info ownership check: None == None resolved ownership to any
+    identity-less caller, who could read another ownerless key's full row."""
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _can_user_query_key_info,
+    )
+
+    key_info = LiteLLM_VerificationToken(token="hashed-ownerless-key", user_id=None, team_id=None)
+    ownerless_caller = UserAPIKeyAuth(user_role=None, user_id=None, api_key="some-other-key")
+
+    allowed = await _can_user_query_key_info(
+        user_api_key_dict=ownerless_caller,
+        key="hashed-ownerless-key",
+        key_info=key_info,
+    )
+
+    assert allowed is False
+
+
+@pytest.mark.asyncio
+async def test_key_info_owner_match_still_reads_the_key_when_user_ids_are_set():
+    """The both-sides-non-None gate must not take ownership reads away from a
+    principal whose user_id genuinely matches the key's owner."""
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _can_user_query_key_info,
+    )
+
+    key_info = LiteLLM_VerificationToken(token="hashed-key", user_id="owner-1", team_id=None)
+    owner = UserAPIKeyAuth(user_role=None, user_id="owner-1", api_key="a-different-key")
+
+    allowed = await _can_user_query_key_info(
+        user_api_key_dict=owner,
+        key="hashed-key",
+        key_info=key_info,
+    )
+
+    assert allowed is True

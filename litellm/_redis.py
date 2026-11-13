@@ -937,7 +937,8 @@ def get_redis_connection_pool(
     **env_overrides,
 ) -> async_redis.BlockingConnectionPool | None:
     redis_kwargs: Final = _credential_provider_auth_kwargs(_get_redis_client_logic(**env_overrides))
-    verbose_logger.debug("get_redis_connection_pool: redis_kwargs", redis_kwargs)
+    # _pretty_print masks password-bearing kwargs instead of logging the raw dict in plaintext at DEBUG
+    _pretty_print_redis_config(redis_kwargs=dict(redis_kwargs))
 
     if "startup_nodes" in redis_kwargs:
         return None

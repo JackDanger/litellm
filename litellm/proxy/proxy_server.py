@@ -14189,6 +14189,10 @@ class _RealtimeErrorEvent(TypedDict):
     error: ReadOnly[_RealtimeErrorBody]
 
 
+class _RealtimeAcceptKwargs(TypedDict, total=False):
+    subprotocol: ReadOnly[str]
+
+
 async def _reject_realtime_session(
     websocket: WebSocket,
     user_api_key_dict: UserAPIKeyAuth,
@@ -14217,6 +14221,21 @@ async def _reject_realtime_session(
         await _release_realtime_max_parallel_slot(user_api_key_dict)
 
 
+def realtime_accept_kwargs(websocket: WebSocket) -> "_RealtimeAcceptKwargs":
+    """Echo only credential-free subprotocols: the OpenAI realtime browser client
+    advertises its bearer as a subprotocol (openai-insecure-api-key.<key>), so
+    echoing requested_protocols[0] reflected a live credential into the 101
+    handshake response headers."""
+    requested_protocols: Final = tuple(
+        protocol.strip()
+        for protocol in (websocket.headers.get("sec-websocket-protocol") or "").split(",")
+        if protocol.strip()
+    )
+    if requested_protocols and not requested_protocols[0].startswith("openai-insecure-api-key."):
+        return {"subprotocol": requested_protocols[0]}
+    return {}
+
+
 @app.websocket("/openai/v1/realtime")
 @app.websocket("/v1/realtime")
 @app.websocket("/realtime")
@@ -14232,12 +14251,6 @@ async def realtime_websocket_endpoint(
     ),
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth_realtime_websocket),
 ):
-    requested_protocols: Final = tuple(
-        protocol.strip()
-        for protocol in (websocket.headers.get("sec-websocket-protocol") or "").split(",")
-        if protocol.strip()
-    )
-
     is_translation: Final = websocket.url.path.endswith("/realtime/translations")
     route_model: Final = _resolve_realtime_route_model(model, intent, is_translation)
     if route_model is None:
@@ -14257,7 +14270,7 @@ async def realtime_websocket_endpoint(
         log_model_access_denial(e)
         await _reject_realtime_session(websocket, user_api_key_dict, code=1008, reason=e.message[:120])
         return
-    await websocket.accept(subprotocol=requested_protocols[0] if requested_protocols else None)
+    await websocket.accept(**realtime_accept_kwargs(websocket))
     await _route_realtime_websocket_session(
         websocket,
         user_api_key_dict,
@@ -14448,13 +14461,8 @@ async def live_sessions_websocket_endpoint(
     user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth_live_websocket)],
     authorize_session_model: Annotated[LiveSessionModelAuthorizer, Depends(live_session_model_authorizer)],
 ) -> None:
-    requested_protocols: Final = tuple(
-        protocol.strip()
-        for protocol in (websocket.headers.get("sec-websocket-protocol") or "").split(",")
-        if protocol.strip()
-    )
     try:
-        await websocket.accept(subprotocol=requested_protocols[0] if requested_protocols else None)
+        await websocket.accept(**realtime_accept_kwargs(websocket))
     except BaseException:
         await _release_realtime_budget_reservation(user_api_key_dict)
         await _release_realtime_max_parallel_slot(user_api_key_dict)

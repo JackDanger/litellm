@@ -3811,7 +3811,12 @@ def _negotiated_websocket_subprotocol(websocket: WebSocket) -> str | None:
         for protocol in (websocket.headers.get("sec-websocket-protocol") or "").split(",")
         if protocol.strip()
     )
-    return requested_subprotocols[0] if requested_subprotocols else None
+    # Do not echo credential-bearing protocol tokens back into the 101 response:
+    # OpenAI realtime clients advertise their key as openai-insecure-api-key.<key>
+    for requested in requested_subprotocols:
+        if not requested.startswith("openai-insecure-api-key."):
+            return requested
+    return None
 
 
 async def _opening_model_refusal(
