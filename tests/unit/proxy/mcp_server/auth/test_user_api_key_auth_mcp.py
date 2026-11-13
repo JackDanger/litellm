@@ -12908,3 +12908,19 @@ async def test_admin_dashboard_session_keeps_the_whole_mcp_registry(
     assert set(await global_mcp_server_manager.get_allowed_mcp_servers(dashboard_session)) == set(
         global_mcp_server_manager.get_registry()
     )
+
+
+def test_oauth2_promotion_requires_exact_header_name() -> None:
+    """OAuth2 promotion must match `authorization` exactly. A prefix match lets a
+    caller-supplied `authorization-<suffix>` header shadow the real Authorization
+    header the promotion is meant to pick up."""
+    headers: Final = Headers(
+        raw=[
+            (b"authorization", b"Bearer real-token"),
+            (b"authorization-wrapper", b"Bearer shadow-token"),
+        ]
+    )
+
+    promoted: Final = MCPRequestHandler.get_oauth2_headers_from_headers(headers)
+
+    assert promoted.get("Authorization") == "Bearer real-token"

@@ -11822,3 +11822,49 @@ def test_stale_team_alias_bypass_flag_is_read_once_per_process(monkeypatch: pyte
     monkeypatch.setenv("LITELLM_ENABLE_TEAM_STALE_ALIAS_BYPASS", "false")
 
     assert (first, pre_call_utils._stale_team_alias_bypass_enabled()) == (True, True)
+
+
+def test_agent_id_attribution_ignores_caller_sent_metadata() -> None:
+    """Spend attribution's agent_id resolves from the key and its invoked agent
+    only. Caller-supplied metadata must not choose which agent a request bills
+    to."""
+    data: Final = {"litellm_metadata": {"agent_id": "attacker-chosen"}}
+
+    result: Final = LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata(
+        data=data,
+        user_api_key_dict=UserAPIKeyAuth(api_key="hashed-key", agent_id="key-owned-agent"),
+        _metadata_variable_name="litellm_metadata",
+    )
+
+    assert result["litellm_metadata"]["agent_id"] == "key-owned-agent"
+
+
+def test_agent_id_attribution_is_neutral_without_a_key_or_invoked_agent() -> None:
+    """With no key- or invoked-owned agent the slot stays empty; the caller's
+    metadata value must not survive into the spend log."""
+    data: Final = {"litellm_metadata": {"agent_id": "attacker-chosen"}}
+
+    result: Final = LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata(
+        data=data,
+        user_api_key_dict=UserAPIKeyAuth(api_key="hashed-key"),
+        _metadata_variable_name="litellm_metadata",
+    )
+
+    assert result["litellm_metadata"]["agent_id"] is None
+
+
+def test_invoked_agent_wins_attribution_over_the_key_own_agent() -> None:
+    """The server-resolved invoked agent takes precedence over the key's own
+    agent_id, as managed agent authorization intends. Endpoints set
+    invoked_agent_id post-auth, so this test assigns it post-construction."""
+    data: Final = {"litellm_metadata": {}}
+    user_api_key_dict: Final = UserAPIKeyAuth(api_key="hashed-key", agent_id="key-agent")
+    user_api_key_dict.invoked_agent_id = "invoked-agent"
+
+    result: Final = LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata(
+        data=data,
+        user_api_key_dict=user_api_key_dict,
+        _metadata_variable_name="litellm_metadata",
+    )
+
+    assert result["litellm_metadata"]["agent_id"] == "invoked-agent"
