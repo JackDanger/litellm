@@ -2292,8 +2292,11 @@ async def global_view_spend_tags(
 
         return response
     except Exception as e:
+        # The traceback stays in the server log; the client body carries the
+        # exception message only.
         error_trace: Final = traceback.format_exc()
-        error_str: Final = str(e) + "\n" + error_trace
+        error_str: Final = str(e)
+        verbose_proxy_logger.error("/spend/tags Error: %s", error_trace)
         if isinstance(e, HTTPException):
             raise ProxyException(
                 message=getattr(e, "detail", f"/spend/tags Error({error_str})"),
@@ -3960,9 +3963,11 @@ async def global_spend_logs(
                 return response
 
     except Exception as e:
+        # The traceback stays in the server log; the client body carries the
+        # exception message only.
         error_trace: Final = traceback.format_exc()
-        error_str: Final = str(e) + "\n" + error_trace
-        verbose_proxy_logger.error("/global/spend/logs Error: %s", error_str)
+        error_str: Final = str(e)
+        verbose_proxy_logger.error("/global/spend/logs Error: %s", error_trace)
         if isinstance(e, HTTPException):
             raise ProxyException(
                 message=getattr(e, "detail", f"/global/spend/logs Error({error_str})"),
@@ -4009,8 +4014,11 @@ async def global_spend():
 
         return {"spend": total_spend, "max_budget": litellm.max_budget}
     except Exception as e:
+        # The traceback stays in the server log; the client body carries the
+        # exception message only.
         error_trace: Final = traceback.format_exc()
-        error_str: Final = str(e) + "\n" + error_trace
+        error_str: Final = str(e)
+        verbose_proxy_logger.error("/global/spend Error: %s", error_trace)
         if isinstance(e, HTTPException):
             raise ProxyException(
                 message=getattr(e, "detail", f"/global/spend Error({error_str})"),

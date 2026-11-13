@@ -8880,3 +8880,32 @@ def test_spend_calculate_rejection_body_is_openai_shaped(client):
     assert error["type"] == "invalid_request_error"
     assert error["param"] is None
     assert error["code"] == "400"
+
+
+def test_spend_tags_error_body_carries_no_traceback(client, monkeypatch):
+    """An unexpected failure inside /spend/tags must keep the full trace
+    server-side. The client body carries the exception message, never stack
+    frames, which leak file paths, versions and SQL fragments."""
+    async def exploding_ui_get_spend_by_tags(**_kwargs):
+        raise RuntimeError("internal detail boom")
+
+    monkeypatch.setattr(
+        "litellm.proxy.spend_tracking.spend_management_endpoints.ui_get_spend_by_tags",
+        exploding_ui_get_spend_by_tags,
+    )
+    # the route's DB-connected check must pass so the handler's own except
+    # block, the code under test, runs
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", MagicMock())
+    app.dependency_overrides[ps.user_api_key_auth] = lambda: UserAPIKeyAuth(
+        user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin_user"
+    )
+    try:
+        response = client.get(
+            "/spend/tags?start_date=2024-01-01&end_date=2024-01-31",
+            headers={"Authorization": "Bearer sk-test"},
+        )
+    finally:
+        app.dependency_overrides.pop(ps.user_api_key_auth, None)
+    assert response.status_code == 500
+    assert response.text.startswith('{"error"') or response.text.startswith('{"detail"'), response.text[:200]
+    assert "Traceback (most recent call last)" not in response.text, response.text[:400]
