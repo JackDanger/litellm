@@ -56,6 +56,7 @@ from litellm.constants import (
     CLI_SSO_SESSION_CACHE_KEY_PREFIX,
     CLI_SSO_SESSION_TTL_SECONDS,
     CP_RETURN_TO_COOKIE_PREFIX,
+    LITELLM_CLI_SESSION_TOKEN_PREFIX,
     LITELLM_CLI_SOURCE_IDENTIFIER,
     LITELLM_UI_SESSION_DURATION,
     MAX_SPENDLOG_ROWS_TO_QUERY,
@@ -359,7 +360,21 @@ def _cli_sso_start_response_body(
 
 
 def _get_cli_sso_start_rate_limit_cache_key(request: Request, use_x_forwarded_for: bool | None = False) -> str:
-    client_ip: Final = get_request_ip_address(request=request, use_x_forwarded_for=use_x_forwarded_for) or "unknown"
+    """Bucket on the RESOLVED client hop, not a raw forwarded-for composite: a
+    load balancer behind the caller shares one raw address across every user."""
+    resolved_client_ip: str | None
+    if use_x_forwarded_for is True and "x-forwarded-for" in request.headers:
+        from litellm.proxy.auth.network import TrustedProxyConfig, resolve_client_ip
+        from litellm.proxy.auth.trusted_proxy_utils import get_trusted_proxy_cidrs
+
+        config: Final = TrustedProxyConfig(
+            use_forwarded_for=True,
+            trusted_proxy_cidrs=get_trusted_proxy_cidrs(),
+        )
+        resolved_client_ip, _via_proxy = resolve_client_ip(request=request, config=config)
+    else:
+        resolved_client_ip = get_request_ip_address(request=request, use_x_forwarded_for=use_x_forwarded_for)
+    client_ip: Final = resolved_client_ip or "unknown"
     client_ip_hash: Final = _hash_cli_sso_secret(client_ip)
     return f"{_CLI_SSO_START_RATE_LIMIT_CACHE_KEY_PREFIX}:{client_ip_hash}"
 
@@ -2297,7 +2312,9 @@ async def _sso_provider_callback(
 @router.get("/sso/callback", tags=["experimental"], include_in_schema=False)
 async def auth_callback(request: Request, state: str | None = None):
     """Verify login"""
-    verbose_proxy_logger.info("Starting SSO callback with state: %s", state)
+    # a CLI state embeds a user_code and key id, so log the state's kind, not its contents
+    state_kind: Final = (state or "").split(":", 1)[0] or None
+    verbose_proxy_logger.info("Starting SSO callback (state kind=%s, present=%s)", state_kind, state is not None)
 
     oauth_error: Final = request.query_params.get("error")
     if oauth_error:
@@ -3354,7 +3371,9 @@ class SSOAuthenticationHandler:
                 dict(GOOGLE_REFRESH_TOKEN_PARAMS) if await login_asks_for_refresh_token(retention_enabled) else None
             )
             with google_sso:
-                return await google_sso.get_login_redirect(state=state, params=google_params)
+                redirect_response: Final = await google_sso.get_login_redirect(state=state, params=google_params)
+                _bind_state_cookie_on_sso_redirect(redirect_response=redirect_response, state=state, request=request)
+                return redirect_response
         # Microsoft SSO Auth
         elif microsoft_client_id is not None:
             microsoft_client_secret: Final = os.getenv("MICROSOFT_CLIENT_SECRET", None)
@@ -3379,7 +3398,9 @@ class SSOAuthenticationHandler:
                 ),
             )
             with microsoft_sso:
-                return await microsoft_sso.get_login_redirect(state=state)
+                redirect_response: Final = await microsoft_sso.get_login_redirect(state=state)
+                _bind_state_cookie_on_sso_redirect(redirect_response=redirect_response, state=state, request=request)
+                return redirect_response
         elif generic_client_id is not None:
             from fastapi_sso.sso.base import DiscoveryDocument
             from fastapi_sso.sso.generic import create_provider
@@ -4743,6 +4764,10 @@ class MicrosoftSSOHandler:
             redirect_uri=redirect_url,
             allow_insecure_http=True,
         )
+        _enforce_sso_browser_state(
+            request=request,
+            state=request.query_params.get("state"),
+        )
         original_msft_result: Final = (
             await microsoft_sso.verify_and_process(
                 request=request,
@@ -5098,6 +5123,11 @@ class GoogleSSOHandler:
             client_secret=google_client_secret,
         )
 
+        _enforce_sso_browser_state(
+            request=request,
+            state=request.query_params.get("state"),
+        )
+
         # if user is trying to get the raw sso response for debugging, return the raw sso response
         result: Final = (
             await google_sso.verify_and_process(request=request, convert_response=False)
@@ -5106,6 +5136,67 @@ class GoogleSSOHandler:
         )
         google_tokens: Final = _SSOTokenResponse.model_validate(google_sso)
         return result or {}, assertion_from_sso_login(google_tokens.id_token, google_tokens.refresh_token)
+
+
+def _bind_state_cookie_on_sso_redirect(
+    *,
+    redirect_response: RedirectResponse,
+    state: str | None,
+    request: Request | None,
+) -> None:
+    """Bind a browser login redirect's ``state`` to the caller's browser.
+
+    Rewrites the redirect's ``Location`` to carry ``state`` (minting one when
+    none was supplied) and sets the ``litellm_oauth_state`` HttpOnly cookie the
+    callback enforces the returned ``state`` against.
+    """
+    if request is None or redirect_response.headers.get("location") is None:
+        return
+    bound_state: Final = state if state is not None else secrets.token_urlsafe(32)
+    location: Final = redirect_response.headers.get("location", "")
+    location_state: Final[Sequence[str]] = parse_qs(urlparse(location).query).get("state", ())
+    if not location_state or location_state[0] != bound_state:
+        separator: Final = "&" if "?" in location else "?"
+        redirect_response.headers["location"] = f"{location}{separator}state={bound_state}"
+    secure_flag: Final = IPAddressUtils.is_request_https(request)
+    redirect_response.set_cookie(
+        key="litellm_oauth_state",
+        value=bound_state,
+        max_age=600,
+        httponly=True,
+        samesite="lax",
+        secure=secure_flag,
+    )
+
+
+def _enforce_sso_browser_state(request: Request, state: str | None) -> None:
+    """Login-CSRF defense for the non-PKCE Google/Microsoft flows.
+
+    fastapi-sso only checks the returned state when one was sent, and silently
+    accepts a callback with none at all, so a pre-minted callback URL would sign
+    a victim's browser into an attacker's account. Enforce the URL ``state``
+    against the ``litellm_oauth_state`` cookie set on the login redirect. CLI
+    device logins (state starts with the CLI session prefix) bind through their
+    single-use poll secret instead, and deployments that cannot carry cookies
+    can disable enforcement with ``general_settings.disable_sso_login_csrf_protection: true``.
+    """
+    from litellm.proxy.proxy_server import general_settings
+
+    if general_settings.get("disable_sso_login_csrf_protection", False) is True:
+        return
+    if state and state.startswith(f"{LITELLM_CLI_SESSION_TOKEN_PREFIX}:"):
+        return
+    if not state:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing state parameter",
+        )
+    cookie_state: Final = request.cookies.get("litellm_oauth_state")
+    if not cookie_state or not secrets.compare_digest(state, cookie_state):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid SSO state parameter: does not match the session-bound OAuth state cookie",
+        )
 
 
 def _raise_if_sso_debug_disabled() -> None:

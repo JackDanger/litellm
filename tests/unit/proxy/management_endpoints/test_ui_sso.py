@@ -10098,8 +10098,8 @@ async def test_ui_login_through_microsoft_or_google_hands_its_assertion_to_the_r
         return payload
 
     mock_request = MagicMock(spec=Request)
-    mock_request.query_params = {"code": "auth-code"}
-    mock_request.cookies = {}
+    mock_request.query_params = {"code": "auth-code", "state": "bound-state"}
+    mock_request.cookies = {"litellm_oauth_state": "bound-state"}
     mock_request.scope = {}
     mock_request.base_url = "http://localhost:4000/"
     redirect_mock = AsyncMock(return_value=MagicMock())
@@ -11517,3 +11517,198 @@ async def test_sso_login_still_joins_the_team_and_warns_when_creating_it_fails(
     warnings: Final = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert events == [("join", "finance")]
     assert len(warnings) == 1 and "finance" in warnings[0] and str(create_error.detail) in warnings[0]
+
+
+class TestSSOCallbackStateLogHygieneAndStateBinding:
+    """The SSO callback log carries the state's kind, not its contents, and the
+    non-PKCE Google/Microsoft flows bind their OAuth state to a browser cookie."""
+
+    @pytest.mark.asyncio
+    async def test_sso_callback_log_carries_the_state_kind_not_its_contents(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from litellm.constants import LITELLM_CLI_SESSION_TOKEN_PREFIX
+        from litellm.proxy.management_endpoints.ui_sso import auth_callback
+
+        state: Final = f"{LITELLM_CLI_SESSION_TOKEN_PREFIX}:key-id-1234:ABCD-1234"
+        request: Final = MagicMock(spec=Request)
+        request.query_params = {}
+
+        with (
+            patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
+            patch("litellm.proxy.proxy_server.master_key", "test-master-key"),
+            patch("litellm.proxy.proxy_server.general_settings", {}),
+        ):
+            with caplog.at_level(logging.INFO, logger=verbose_proxy_logger.name):
+                try:
+                    await auth_callback(request=request, state=state)
+                except Exception:
+                    pass  # only the log line is under test; the IdP flow may abort after it
+
+        assert f"state kind={LITELLM_CLI_SESSION_TOKEN_PREFIX}" in caplog.text
+        assert "key-id-1234" not in caplog.text
+        assert "ABCD-1234" not in caplog.text
+
+    def test_bind_state_cookie_mints_state_and_sets_browser_cookie(self) -> None:
+        from fastapi.responses import RedirectResponse
+
+        from litellm.proxy.management_endpoints.ui_sso import _bind_state_cookie_on_sso_redirect
+
+        response: Final = RedirectResponse(url="https://idp.example.com/auth")
+        request: Final = MagicMock(spec=Request)
+
+        with patch(
+            "litellm.proxy.management_endpoints.ui_sso.IPAddressUtils.is_request_https",
+            staticmethod(lambda request: True),
+        ):
+            _bind_state_cookie_on_sso_redirect(redirect_response=response, state=None, request=request)
+
+        location: Final = response.headers["location"]
+        cookie: Final = next(c for c in response.headers.getlist("set-cookie") if "litellm_oauth_state=" in c)
+        assert location.split("state=")[1] == cookie.split("litellm_oauth_state=")[1].split(";")[0]
+        assert "httponly" in cookie.lower() and "samesite=lax" in cookie.lower() and "secure" in cookie.lower()
+
+    def test_bind_state_cookie_keeps_a_cli_state_already_on_the_redirect(self) -> None:
+        """A CLI login redirect already carries its own state; binding must reuse
+        it instead of minting a second one into the authorization URL."""
+        from fastapi.responses import RedirectResponse
+
+        from litellm.constants import LITELLM_CLI_SESSION_TOKEN_PREFIX
+        from litellm.proxy.management_endpoints.ui_sso import _bind_state_cookie_on_sso_redirect
+
+        cli_state: Final = f"{LITELLM_CLI_SESSION_TOKEN_PREFIX}:cli-new-session-key-456"
+        response: Final = RedirectResponse(url=f"https://idp.example.com/auth?state={cli_state}")
+        request: Final = MagicMock(spec=Request)
+
+        _bind_state_cookie_on_sso_redirect(redirect_response=response, state=cli_state, request=request)
+
+        assert response.headers["location"].split("state=").count(cli_state) == 1
+        cookie: Final = next(c for c in response.headers.getlist("set-cookie") if "litellm_oauth_state=" in c)
+        assert cookie.split("litellm_oauth_state=")[1].split(";")[0] == cli_state
+
+    def test_enforce_sso_browser_state_rejects_missing_and_mismatched_states(self) -> None:
+        from litellm.proxy.management_endpoints.ui_sso import _enforce_sso_browser_state
+
+        request: Final = MagicMock(spec=Request)
+        with pytest.raises(HTTPException) as missing:
+            _enforce_sso_browser_state(request=request, state=None)
+        assert missing.value.status_code == 400
+
+        request.cookies = {"litellm_oauth_state": "AAA"}
+        with pytest.raises(HTTPException) as mismatched:
+            _enforce_sso_browser_state(request=request, state="BBB")
+        assert mismatched.value.status_code == 401
+
+    def test_enforce_sso_browser_state_passes_on_match_and_cli_states(self) -> None:
+        from litellm.constants import LITELLM_CLI_SESSION_TOKEN_PREFIX
+        from litellm.proxy.management_endpoints.ui_sso import _enforce_sso_browser_state
+
+        request: Final = MagicMock(spec=Request)
+        request.cookies = {"litellm_oauth_state": "AAA"}
+        _enforce_sso_browser_state(request=request, state="AAA")
+        # CLI logins bind through their single-use poll secret, not a browser form
+        _enforce_sso_browser_state(
+            request=MagicMock(spec=Request, cookies={}), state=f"{LITELLM_CLI_SESSION_TOKEN_PREFIX}:xyz"
+        )
+
+    def test_enforce_sso_browser_state_honors_the_opt_out(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import litellm.proxy.proxy_server as proxy_server_module
+        from litellm.proxy.management_endpoints.ui_sso import _enforce_sso_browser_state
+
+        monkeypatch.setattr(proxy_server_module, "general_settings", {"disable_sso_login_csrf_protection": True})
+        _enforce_sso_browser_state(request=MagicMock(spec=Request, cookies={}), state=None)
+
+    @pytest.mark.asyncio
+    async def test_microsoft_callback_enforces_the_bound_state_before_the_idp_call(self) -> None:
+        from starlette.requests import Request as StarletteRequest
+
+        from litellm.proxy.management_endpoints.ui_sso import MicrosoftSSOHandler
+
+        request: Final = StarletteRequest(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/sso/callback",
+                "query_string": b"code=test-code&state=evil-state",
+                "headers": [(b"cookie", b"litellm_oauth_state=bound-state")],
+            }
+        )
+        verify: Final = AsyncMock()
+
+        with (
+            patch.dict(os.environ, {"MICROSOFT_CLIENT_SECRET": "secret", "MICROSOFT_TENANT": "tenant"}),
+            patch(
+                "fastapi_sso.sso.microsoft.MicrosoftSSO.verify_and_process",
+                new=verify,
+            ),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await MicrosoftSSOHandler.get_microsoft_callback_response(
+                request=request,
+                microsoft_client_id="cid",
+                redirect_url="http://redirect",
+            )
+
+        assert exc_info.value.status_code == 401
+        verify.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_google_callback_enforces_the_bound_state_before_the_idp_call(self) -> None:
+        from starlette.requests import Request as StarletteRequest
+
+        from litellm.proxy.management_endpoints.ui_sso import GoogleSSOHandler
+
+        request: Final = StarletteRequest(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/sso/callback",
+                "query_string": b"code=test-code&state=evil-state",
+                "headers": [(b"cookie", b"litellm_oauth_state=bound-state")],
+            }
+        )
+        verify: Final = AsyncMock()
+
+        with (
+            patch.dict(os.environ, {"GOOGLE_CLIENT_SECRET": "secret"}),
+            patch(
+                "fastapi_sso.sso.google.GoogleSSO.verify_and_process",
+                new=verify,
+            ),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await GoogleSSOHandler.get_google_callback_response(
+                request=request,
+                google_client_id="cid",
+                redirect_url="http://redirect",
+            )
+
+        assert exc_info.value.status_code == 401
+        verify.assert_not_awaited()
+
+    def test_cli_sso_start_rate_limit_buckets_on_the_resolved_client_hop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Behind a trusted load balancer the throttle buckets on the resolved
+        client, so users do not share one bucket and a caller cannot dodge it by
+        rewriting the leftmost forwarded-for hop."""
+        import litellm.proxy.proxy_server as proxy_server_module
+        from litellm.proxy.management_endpoints.ui_sso import _get_cli_sso_start_rate_limit_cache_key
+
+        monkeypatch.setattr(proxy_server_module, "general_settings", {"trusted_proxy_ranges": ["10.0.0.0/8"]})
+
+        def _request(xff: str) -> MagicMock:
+            request = MagicMock(spec=Request)
+            request.client = MagicMock()
+            request.client.host = "10.0.0.5"
+            request.headers = {"x-forwarded-for": xff}
+            return request
+
+        first: Final = _get_cli_sso_start_rate_limit_cache_key(_request("192.0.2.7, 10.0.0.99"), use_x_forwarded_for=True)
+        translated_by_the_lb_again: Final = _get_cli_sso_start_rate_limit_cache_key(
+            _request("192.0.2.7, 10.0.0.1"), use_x_forwarded_for=True
+        )
+        other_claimed_hop: Final = _get_cli_sso_start_rate_limit_cache_key(
+            _request("192.0.2.9, 10.0.0.1"), use_x_forwarded_for=True
+        )
+
+        assert first == translated_by_the_lb_again
+        assert other_claimed_hop != first

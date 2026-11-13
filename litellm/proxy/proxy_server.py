@@ -19702,6 +19702,9 @@ async def login_v3(request: Request):
             )
 
 
+_login_code_exchange_lock: Final = asyncio.Lock()
+
+
 @router.post("/v3/login/exchange", include_in_schema=False)  # exchange single-use opaque code for JWT
 async def login_v3_exchange(request: Request):
     from litellm.proxy.management_endpoints.ui_sso import set_session_token_cookie
@@ -19726,11 +19729,29 @@ async def login_v3_exchange(request: Request):
             )
 
         cache_key: Final = f"login_code:{code}"
-        cached_data: Final[object] = _UNTYPED_VALUE.validate_python(
-            await redis_usage_cache.async_get_cache(key=cache_key)
-            if redis_usage_cache is not None
-            else await user_api_key_cache.async_get_cache(key=cache_key)
-        )
+        if redis_usage_cache is not None:
+            # a SET NX claim happens BEFORE the read, so two concurrent exchanges
+            # cannot both redeem one code; redis answers None when the claim is lost
+            claim_key: Final = f"login_code_claim:{code}"
+            claimed: Final[object] = await redis_usage_cache.async_set_cache(key=claim_key, value=True, ttl=60, nx=True)
+            if claimed is not True:
+                raise ProxyException(
+                    message="Invalid or expired login code",
+                    type=ProxyErrorTypes.auth_error,
+                    param="code",
+                    code=status.HTTP_401_UNAUTHORIZED,
+                )
+
+        async with _login_code_exchange_lock:
+            cached_data: Final[object] = _UNTYPED_VALUE.validate_python(
+                await redis_usage_cache.async_get_cache(key=cache_key)
+                if redis_usage_cache is not None
+                else await user_api_key_cache.async_get_cache(key=cache_key)
+            )
+            if redis_usage_cache is None:
+                # with no shared store the delete must stay inside the critical
+                # section, or a second same-pod exchange can still read the code
+                await user_api_key_cache.async_delete_cache(key=cache_key)
 
         if not cached_data or not isinstance(cached_data, dict):
             raise ProxyException(
@@ -19743,8 +19764,6 @@ async def login_v3_exchange(request: Request):
         # Single-use: delete immediately
         if redis_usage_cache is not None:
             await redis_usage_cache.async_delete_cache(key=cache_key)
-        else:
-            await user_api_key_cache.async_delete_cache(key=cache_key)
 
         json_response: Final = JSONResponse(
             content={
@@ -19799,10 +19818,11 @@ async def onboarding(invite_link: str, request: Request):
     if invite_obj is None:
         raise HTTPException(status_code=401, detail={"error": "Invitation link does not exist in db."})
     #### CHECK IF EXPIRED
-    # Extract the date part from both datetime objects
-    utc_now_date: Final = litellm.utils.get_utc_datetime().date()
-    expires_at_date: Final = invite_obj.expires_at.date()
-    if expires_at_date < utc_now_date:
+    # full datetimes: a date-granular comparison left a link working all of its
+    # last day after expiry
+    utc_now: Final = litellm.utils.get_utc_datetime()
+    expires_at: Final = invite_obj.expires_at
+    if expires_at < utc_now:
         raise HTTPException(status_code=401, detail={"error": "Invitation link has expired."})
 
     #### CHECK IF ALREADY USED
@@ -19996,10 +20016,11 @@ async def claim_onboarding_link(data: InvitationClaim, request: Request):
     if invite_obj is None:
         raise HTTPException(status_code=401, detail={"error": "Invitation link does not exist in db."})
     #### CHECK IF EXPIRED
-    # Extract the date part from both datetime objects
-    utc_now_date: Final = litellm.utils.get_utc_datetime().date()
-    expires_at_date: Final = invite_obj.expires_at.date()
-    if expires_at_date < utc_now_date:
+    # full datetimes: a date-granular comparison left a link working all of its
+    # last day after expiry
+    utc_now: Final = litellm.utils.get_utc_datetime()
+    expires_at: Final = invite_obj.expires_at
+    if expires_at < utc_now:
         raise HTTPException(status_code=401, detail={"error": "Invitation link has expired."})
 
     #### CHECK IF ALREADY USED
