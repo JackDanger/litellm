@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { ExternalLink, Search } from "lucide-react";
+import { isHttpUrl } from "@/utils/safeExternalUrl";
 import { useTranslation } from "react-i18next";
 import { toast } from "@/lib/toast";
 import { searchToolQueryCall } from "@/components/networking";
@@ -184,7 +185,7 @@ export const SearchToolTester: React.FC<SearchToolTesterProps> = ({ searchToolNa
                             <div className="p-5">
                               <div className="mb-2 flex items-start justify-between gap-3">
                                 <a
-                                  href={result.url}
+                                  href={isHttpUrl(result.url) ? result.url : undefined}
                                   target="_blank"
                                   rel="noopener noreferrer"
                                   className="flex-1 text-lg leading-snug font-semibold text-primary hover:underline"
@@ -196,7 +197,7 @@ export const SearchToolTester: React.FC<SearchToolTesterProps> = ({ searchToolNa
                                   size="icon-sm"
                                   aria-label={t("searchTools.tester.openResult")}
                                   className="shrink-0 text-muted-foreground"
-                                  onClick={() => window.open(result.url, "_blank")}
+                                  onClick={() => isHttpUrl(result.url) && window.open(result.url, "_blank")}
                                 >
                                   <ExternalLink className="size-4" />
                                 </Button>

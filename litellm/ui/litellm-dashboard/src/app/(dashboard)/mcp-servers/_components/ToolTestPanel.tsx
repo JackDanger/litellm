@@ -1,5 +1,6 @@
 import React from "react";
 import { CircleHelp, X } from "lucide-react";
+import { isHttpUrl } from "@/utils/safeExternalUrl";
 import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
@@ -523,7 +524,7 @@ export function ToolTestPanel({
                                           resourceType: content.resource_type,
                                         })}
                                       </p>
-                                      {content.url && (
+                                      {isHttpUrl(content.url) && (
                                         <a
                                           href={content.url}
                                           target="_blank"
